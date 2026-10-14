@@ -106,39 +106,40 @@ DEFAULT_CONFIG = {
     "device_priority": "NPU,GPU,CPU",  # accelerator preference order (CPU always last)
     # Inference rate cap. Higher = lower end-to-end latency (fresher positions), so set this
     # as high as the accelerator can sustain; the capture thread already drops stale frames.
-    "max_fps": 10,
-    "conf_threshold": 0.70,        # min person confidence to consider a detection
-    "iou_match_threshold": 0.30,   # min box overlap (IoU) to treat as the same person across frames
-    "min_consecutive_frames": 3,   # consecutive hits required to register a track
-    "subsequent_conf_threshold": 0.50,  # lower conf allowed for an already-confirmed (tracked) person
-    "track_validity_ms": 500,      # keep coasting (predicted) a track this long without a detection
+    "max_fps": 16,
+    "conf_threshold": 0.55,        # min person confidence to consider a detection
+    "iou_match_threshold": 0.15,   # min box overlap (IoU) to treat as the same person across frames
+    "min_consecutive_frames": 2,   # consecutive hits required to register a track
+    "subsequent_conf_threshold": 0.40,  # lower conf allowed for an already-confirmed (tracked) person
+    "track_validity_ms": 800,      # keep coasting (predicted) a track this long without a detection
     # Position output is the Kalman-filtered box. These two knobs tune latency vs steadiness:
     # position_smoothing: 0 = near-real-time / lowest latency (raw-ish, some jitter) .. 1 = heavy
     #   smoothing (steady dot, slightly laggy). Maps to the filter's measurement noise (R).
-    "position_smoothing": 0.25,
+    "position_smoothing": 0.10,
     # track_agility: how quickly the filter follows sudden speed changes. Higher = the reported
     #   position stays locked to fast/quick movement. Maps to the velocity process noise (Q).
-    "track_agility": 0.5,
+    "track_agility": 0.6,
     "auto_start": False,  # if False, inference waits until started from the UI
-    "rtsp_url": "rtsp://admin:abc123456%3F@192.168.1.56:554/media/video2",
-    "esp32_host": "192.168.1.51",  # ESP32 GPIO controller IP (blank = auto-discover)
+    # Site/network settings are intentionally blank -- fill them in on /setup.
+    "rtsp_url": "",                # e.g. rtsp://user:pass@host:554/path
+    "esp32_host": "",              # ESP32 GPIO controller IP (blank = auto-discover)
     "esp32_udp_port": 5001,
     "esp32_tcp_port": 5000,
     "output_names": {f"out_{i}": f"Output {i}" for i in range(1, 9)},
-    "inclusion_polygon": [],  # [[x,y], [x,y], [x,y], [x,y]] normalized 0-100
-    "exclusion_polygons": [], # [[[x,y], ...], ...]
-    "base_line": {"p1": [10, 80], "p2": [90, 80]},
+    "inclusion_polygon": [[41.5, 53.1], [43.4, 75.3], [84.4, 72.8], [83.9, 55.2]],  # [[x,y] x4] normalized 0-100
+    "exclusion_polygons": [],  # [[[x,y], ...], ...]
+    "base_line": {"p1": [44.7, 63.8], "p2": [81.4, 63.2]},
     "threshold_point": 50.0,
-    "threshold_delay": 0.0,  # seconds after the threshold cross before reverse logic activates
+    "threshold_delay": 5.0,  # seconds after the threshold cross before reverse logic activates
     "outputs": {
-        "1": {"trigger": 20.0, "duration": 180, "depends": False, "max_act": 1, "reverse": False},
-        "2": {"trigger": 40.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "3": {"trigger": 60.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "4": {"trigger": 70.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "5": {"trigger": 80.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "6": {"trigger": 85.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "7": {"trigger": 90.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
-        "8": {"trigger": 95.0, "duration": 1, "depends": True, "max_act": 1, "reverse": False},
+        "1": {"trigger": 15.0, "duration": 180, "depends": False, "max_act": 1, "reverse": False},
+        "2": {"trigger": 40.0, "duration": 8, "depends": True, "max_act": 1, "reverse": False},
+        "3": {"trigger": 60.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
+        "4": {"trigger": 70.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
+        "5": {"trigger": 80.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
+        "6": {"trigger": 85.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
+        "7": {"trigger": 90.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
+        "8": {"trigger": 20.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": True},
     }
 }
 
@@ -1692,9 +1693,9 @@ SETUP_HTML = """
         <option value="CPU">CPU only</option>
       </select>
       <label>RTSP Stream URL</label>
-      <input type="text" id="rtsp_url">
+      <input type="text" id="rtsp_url" placeholder="rtsp://user:pass@192.168.1.x:554/stream">
       <label>ESP32 GPIO Controller IP (blank = auto-discover)</label>
-      <input type="text" id="esp32_host" placeholder="192.168.1.51">
+      <input type="text" id="esp32_host" placeholder="192.168.1.x">
       <label>Threshold Point (0-100)</label>
       <input type="number" id="threshold_point" step="0.1">
       <label>Threshold Delay (seconds after threshold cross)</label>
