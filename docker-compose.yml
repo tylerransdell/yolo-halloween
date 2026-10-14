@@ -1,0 +1,14 @@
+services:
+  halloween-engine:
+    build: .
+    container_name: halloween-engine
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    volumes:
+      - ./data:/data
+    # No environment overrides needed -- every knob defaults sensibly in main.py.
+    # Available if ever needed: HALO_SIMULATE=1 (synthetic positions for UI testing),
+    # HALO_FFMPEG_QUIET=0 (show raw FFmpeg stderr), HALO_WEIGHTS=<path to yolo26m.pt>,
+    # HALO_CONFIG / HALO_MODEL_DIR (override the /data paths).
+    privileged: true

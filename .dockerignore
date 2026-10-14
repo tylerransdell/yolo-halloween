@@ -1,0 +1,18 @@
+# NOTE: ./deps is intentionally NOT ignored here -- if you populated it with
+# ./fetch_deps.sh the Dockerfile reuses those .debs instead of re-downloading.
+# (It stays out of git via .gitignore.)
+
+# Python caches / bytecode
+__pycache__/
+*.py[cod]
+
+# Local dev/test helpers -- not shipped in the image (see .gitignore)
+test/
+
+# Runtime volume -- supplied by the ./data:/data mount, not baked into the image
+# (keeps the live config/credentials and the generated model out of the image).
+data/
+
+# Local notes & scratch
+error.md
+*.log

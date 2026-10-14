@@ -1,0 +1,16 @@
+# Vendored Intel NPU + GPU driver .debs are produced by ./fetch_deps.sh (or fetched by the
+# Dockerfile on demand) -- never committed. Keeping them out of git keeps the repo small;
+# they are intentionally NOT listed in .dockerignore so a locally-built ./deps can be reused.
+deps/
+
+# Local dev/test helpers (smoke_test.py, tracker_test.py, esp32_check.py).
+# Kept on disk for local use, but never committed and never baked into the image.
+test/
+
+# Runtime state / mounted volume (./data:/data). Holds the live config (RTSP credentials)
+# and the generated OpenVINO IR -- recreated at runtime, so never committed.
+data/
+
+# Python caches / bytecode
+__pycache__/
+*.py[cod]
