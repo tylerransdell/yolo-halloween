@@ -646,11 +646,12 @@ async def _eval_reverse_outputs(cur_max, now: float):
             await send_esp32_command(ch, 1)
 
 # --- FSM & AUTOMATION LOGIC ---
-async def evaluate_fsm(positions: List[float]):
-    global state
-    cfg_outputs = config["outputs"]
-    now = time.time()
-    
+async def _expire_outputs(now: float, cfg_outputs: dict):
+    """Turn OFF any output whose configured duration has elapsed (and clear its state).
+
+    Kept separate from evaluate_fsm so it can ALSO run from a dedicated loop while the engine
+    is stopped: a manual trigger from the UI must still pulse for its duration instead of
+    latching ON forever (which is what happened when inference wasn't running to expire it)."""
     for ch_str in list(state.output_states.keys()):
         if state.output_states[ch_str] == 1 and now >= state.output_timers[ch_str]:
             state.output_states[ch_str] = 0
@@ -660,6 +661,13 @@ async def evaluate_fsm(positions: List[float]):
                 # Any output that does not depend on Main (or Main itself) ends the
                 # whole sequence when its duration expires -> global reset.
                 await trigger_full_reset(f"Output {ch_str} duration expired")
+
+async def evaluate_fsm(positions: List[float]):
+    global state
+    cfg_outputs = config["outputs"]
+    now = time.time()
+    
+    await _expire_outputs(now, cfg_outputs)
 
     threshold = config["threshold_point"]
     threshold_delay = float(config.get("threshold_delay", 0.0) or 0.0)
@@ -716,6 +724,19 @@ async def trigger_full_reset(reason: str, esp_budget: float = 3.0):
     print(f"[reset] {reason}", flush=True)
     for ch in range(1, 9):
         queue_esp32_command(ch, 0)
+
+async def output_expiry_loop():
+    """Expire output timers independently of the inference loop.
+
+    A manual trigger from the Output Control Panel must fire for its configured duration even
+    while the engine is stopped -- otherwise nothing clears the timer and the output latches
+    ON. This also guarantees an output can never stay ON if inference stalls."""
+    while True:
+        try:
+            await _expire_outputs(time.time(), config["outputs"])
+        except Exception as e:
+            print(f"[outputs] expiry error: {e}", flush=True)
+        await asyncio.sleep(0.05)
 
 async def start_engine():
     """Full reset (all GPIO outputs LOW) BEFORE inference begins."""
@@ -1271,6 +1292,7 @@ async def startup_event():
     asyncio.create_task(esp32_discovery_loop())
     asyncio.create_task(esp32_health_loop())
     asyncio.create_task(esp32_dispatch_loop())
+    asyncio.create_task(output_expiry_loop())
     asyncio.create_task(inference_worker())
     asyncio.create_task(_boot_sequence())
 
@@ -1517,7 +1539,7 @@ EXECUTE_HTML = """
     async function loadNames() {
       const res = await fetch('/api/config');
       const cfg = await res.json();
-      outputNames = cfg.output_names;
+      outputNames = cfg.output_names || {};
     }
     // Draw the linear-model visualization: baseline, output triggers, threshold, and a
     // labeled dot per tracked person (stable id => the dot you watch stays the same).
@@ -1564,6 +1586,33 @@ EXECUTE_HTML = """
         ctx.fillStyle = '#e0f2fe';
         ctx.fillText('#' + t.id + ' ' + t.position.toFixed(1), x, y + 14);
       });
+    }
+
+    // Build the output buttons ONCE, then only patch labels/state in place.
+    // NOTE: rebuilding the grid via innerHTML on every status tick (10 Hz over SSE) tore
+    // down the nodes mid-click: mousedown landed on the old button and mouseup on the new
+    // one, so the browser fired `click` on #outputsGrid (no handler) and nothing happened.
+    let outputsBuilt = false;
+    function ensureOutputsGrid() {
+      if (outputsBuilt) return;
+      const grid = document.getElementById('outputsGrid');
+      if (!grid) return;
+      let html = '';
+      for (let i = 1; i <= 8; i++) {
+        html += `<button id="outBtn${i}" class="output-btn" onclick="triggerOutput(${i})"></button>`;
+      }
+      grid.innerHTML = html;
+      outputsBuilt = true;
+    }
+    function updateOutputsGrid(states) {
+      ensureOutputsGrid();
+      for (let i = 1; i <= 8; i++) {
+        const btn = document.getElementById('outBtn' + i);
+        if (!btn) continue;
+        const name = (i === 1) ? "Main" : (outputNames[`out_${i}`] || `Output ${i}`);
+        if (btn.textContent !== name) btn.textContent = name;
+        btn.classList.toggle('active', states[String(i)] === 1);
+      }
     }
 
     // Apply a status payload (used by both SSE push and the polling fallback).
@@ -1616,14 +1665,7 @@ EXECUTE_HTML = """
         setTxt('esp32Cmd', data.last_command || '-');
         setTxt('esp32Resp', data.last_response || '-');
 
-        let gridHtml = '';
-        for (let i = 1; i <= 8; i++) {
-          const chStr = i.toString();
-          const isActive = data.output_states[chStr] === 1;
-          const name = (i === 1) ? "Main (Output 1)" : (outputNames[`out_${i}`] || `Output ${i}`);
-          gridHtml += `<button class="output-btn ${isActive ? 'active' : ''}" onclick="triggerOutput(${i})">${name}</button>`;
-        }
-        document.getElementById('outputsGrid').innerHTML = gridHtml;
+        updateOutputsGrid(data.output_states || {});
     }
     async function updateStatus() {
       try { applyStatus(await (await fetch('/api/status')).json()); }
@@ -1896,6 +1938,9 @@ SETUP_HTML = """
       } catch (e) {}
     }
 
+    // Escape a user-entered name before injecting it into an HTML attribute.
+    const escAttr = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
     async function loadConfig() {
       const res = await fetch('/api/config');
       const cfg = await res.json();
@@ -1924,9 +1969,12 @@ SETUP_HTML = """
       let html = '';
       for (let i = 2; i <= 8; i++) {
         const o = cfg.outputs[i.toString()];
+        const nm = (cfg.output_names || {})[`out_${i}`] ?? `Output ${i}`;
         html += `
           <div style="border-top: 1px solid #334155; margin-top: 10px; padding-top: 10px;">
             <h4>Output ${i}</h4>
+            <label>Button Name (shown on Execute page)</label>
+            <input type="text" id="out_${i}_name" value="${escAttr(nm)}" placeholder="Output ${i}">
             <label>Trigger Position</label>
             <input type="number" id="out_${i}_trigger" value="${o.trigger}" step="0.1">
             <label>Duration (s)</label>
@@ -1982,6 +2030,7 @@ SETUP_HTML = """
       cfg.outputs["1"].trigger = parseFloat(document.getElementById('out1_trigger').value);
       cfg.outputs["1"].duration = parseFloat(document.getElementById('out1_duration').value);
 
+      cfg.output_names = cfg.output_names || {};
       for (let i = 2; i <= 8; i++) {
         const reverse = document.getElementById(`out_${i}_reverse`).checked;
         cfg.outputs[i.toString()] = {
@@ -1991,6 +2040,7 @@ SETUP_HTML = """
           max_act: parseInt(document.getElementById(`out_${i}_max`).value),
           reverse: reverse
         };
+        cfg.output_names[`out_${i}`] = document.getElementById(`out_${i}_name`).value.trim() || `Output ${i}`;
       }
 
       await fetch('/api/config', {

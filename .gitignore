@@ -14,3 +14,6 @@ data/
 # Python caches / bytecode
 __pycache__/
 *.py[cod]
+
+# Local design notes / working spec -- kept on disk for reference, never committed.
+plan.md
