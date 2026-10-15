@@ -48,13 +48,57 @@ Then open **http://docker-host:8777** (that's the web UI) and:
 
 1. **Calibrate** on `/setup` — set the RTSP URL, grab a snapshot, draw the inclusion zone and base line, and set the threshold. Name and tune Outputs 2-8 here too.
 2. **Start the engine** from `/execute` (or tick *Auto-start engine on boot* on `/setup`). Nothing fires automatically until it's running — the manual output buttons work regardless.
-3. **Flash the ESP32** — paste `esp32/firmware.cpp` into the Arduino IDE (ESP32 core), set your WiFi SSID/password, and flash. Outputs 1-8 default to GPIO 32, 33, 25, 26, 27, 18, 19, 23. It also serves its own control page on port 80 and talks to the backend on TCP 5000 (UDP discovery on 5001).
+3. **Flash the ESP32** — paste `esp32/firmware.cpp` into the Arduino IDE (ESP32 core), set your WiFi SSID/password, and flash. It serves its own control page on port 80 and talks to the backend on TCP 5000 (UDP discovery on 5001). Pin map is in [ESP32 wiring](#esp32-wiring) below.
 4. **Model** — the backend loads the OpenVINO IR from `/data/models/yolo26m`. Build it with `build_model.py`, or drop `yolo26m.pt` in `/data/models` and it converts on first load.
 
 Hardware is cheap and easy if you already have an Intel inference box: 1x ESP32, 1x darlington array,
 and 1-2x 8-channel relay boards (one darlington collector can drive several relays). That
 gives you universal dry-contact triggers for quick scares, smoke machines (longer duration =
 more smoke), and active/idle scene switching on AC or DC.
+
+## ESP32 wiring
+
+8 channels in a fixed GPIO order, **active HIGH** (a HIGH drives the relay on):
+
+| Output | GPIO |
+| --- | --- |
+| 1 — Main | 32 |
+| 2 | 33 |
+| 3 | 25 |
+| 4 | 26 |
+| 5 | 27 |
+| 6 | 18 |
+| 7 | 19 |
+| 8 | 23 |
+
+Each output feeds a darlington input, and one darlington collector can drive several relay
+coils — so you can fan a single channel out to multiple relays.
+
+## Knobs
+
+Everything's on `/setup`, saves to `./data/config.yml`, and most of it applies **live** (no
+restart). Three groups: what the detector believes, how the dot moves, and what fires.
+
+**Camera & system**
+- **Device priority** — accelerator order (CPU is always the fallback). Changing it recompiles the model.
+- **RTSP URL** and **ESP32 host** (blank = UDP auto-discovery).
+- **Max inference FPS** — cap; higher = fresher positions, stale frames are dropped automatically.
+- **Auto-start engine on boot** — otherwise you press START ENGINE on `/execute`.
+
+**Detection & tracking**
+- **Person confidence** — min score to count as a detection.
+- **Subsequent confidence** — lower score allowed to *extend* an already-tracked person.
+- **IoU match** — min box overlap to consider it the same person between frames.
+- **Consecutive detections** — hits required before a track registers.
+- **Track validity window (ms)** — how long a missed track coasts before it's dropped. Think in **frames**, not ms: **2–5 frames' worth** is the sweet spot (default **200 ms**), scaled by your FPS. Too long and the dot extrapolates past a person who just stopped (elastic overshoot).
+
+**Position filter (Kalman)** — the reported 0–100 is the *filtered* box bottom-center (drives the dot, the triggers, and the baseline).
+- **Position smoothing (0–1)** — low = near-real-time (some jitter); high = steady but laggy.
+- **Track agility (0–1)** — how fast the filter follows sudden speed changes; higher stays locked to fast moves but is jumpier.
+
+**Triggers & outputs**
+- **Threshold point** + **threshold delay** — where the reverse logic arms, and how long after the cross it waits.
+- **Outputs 1–8** — trigger point, duration, depends-on-Main, max activations, reverse; plus **button names** for 2–8 (Main always reads "Main").
 
 ## Roadmap
 

@@ -111,7 +111,9 @@ DEFAULT_CONFIG = {
     "iou_match_threshold": 0.15,   # min box overlap (IoU) to treat as the same person across frames
     "min_consecutive_frames": 2,   # consecutive hits required to register a track
     "subsequent_conf_threshold": 0.40,  # lower conf allowed for an already-confirmed (tracked) person
-    "track_validity_ms": 800,      # keep coasting (predicted) a track this long without a detection
+    "track_validity_ms": 200,      # keep coasting (predicted) a track this long without a detection.
+                                   # ~200 ms (a few frames): long windows extrapolate a stopped
+                                   # person past themselves -> overshoot / elastic dot.
     # Position output is the Kalman-filtered box. These two knobs tune latency vs steadiness:
     # position_smoothing: 0 = near-real-time / lowest latency (raw-ish, some jitter) .. 1 = heavy
     #   smoothing (steady dot, slightly laggy). Maps to the filter's measurement noise (R).
@@ -1146,7 +1148,7 @@ def _process_frame(frame, now=None):
     iou_match = float(config.get("iou_match_threshold", 0.30) or 0.30)
     confirm_hits = int(config.get("min_consecutive_frames", 3) or 1)
     sub_conf = float(config.get("subsequent_conf_threshold", 0.50) or 0.0)
-    validity_ms = float(config.get("track_validity_ms", 500) or 0.0)
+    validity_ms = float(config.get("track_validity_ms", 200) or 0.0)
 
     # Decode down to the LOWER of the two thresholds so low-confidence detections are
     # still available to extend already-confirmed tracks (see _confirm_tracks).
@@ -1762,10 +1764,11 @@ SETUP_HTML = """
       <label>Subsequent Confidence Threshold (0-1, for already-tracked persons)</label>
       <input type="number" id="subsequent_conf_threshold" step="0.01" min="0" max="0.99">
       <label>Track Validity Window (ms)</label>
-      <input type="number" id="track_validity_ms" step="50" min="0" max="5000" placeholder="500">
-      <div class="hint">Suggested <b>300&ndash;800 ms</b> (default 500). How long a person may be missed
-        before their track is dropped. Shorter = reacts faster when people leave the frame; longer =
-        rides out brief detector dropouts without losing the track.</div>
+      <input type="number" id="track_validity_ms" step="50" min="0" max="5000" placeholder="200">
+      <div class="hint">Suggested <b>2&ndash;5 frames&rsquo; worth</b> (default <b>200 ms</b>). How long a
+        missed track keeps coasting before it&rsquo;s dropped. It&rsquo;s really a frame budget &mdash; scale by
+        your FPS (4 frames &asymp; 250 ms @ 16 FPS, &asymp; 130 ms @ 30 FPS). Shorter = coasts less, so the
+        dot won&rsquo;t fly past when someone stops; longer = rides out brief dropouts without losing the track.</div>
 
       <div style="border-top:1px solid #334155; margin-top:14px; padding-top:12px;">
         <label style="margin-top:0;">Position Filter (Kalman)</label>
@@ -1958,7 +1961,7 @@ SETUP_HTML = """
       document.getElementById('iou_match_threshold').value = cfg.iou_match_threshold ?? 0.30;
       document.getElementById('min_consecutive_frames').value = cfg.min_consecutive_frames ?? 3;
       document.getElementById('subsequent_conf_threshold').value = cfg.subsequent_conf_threshold ?? 0.50;
-      document.getElementById('track_validity_ms').value = cfg.track_validity_ms ?? 500;
+      document.getElementById('track_validity_ms').value = cfg.track_validity_ms ?? 200;
       const ps = cfg.position_smoothing;
       document.getElementById('position_smoothing').value =
         (typeof ps === 'number') ? ps : (ps === false ? 0 : 0.25);   // migrate old true/false
@@ -2019,7 +2022,7 @@ SETUP_HTML = """
       cfg.min_consecutive_frames = parseInt(document.getElementById('min_consecutive_frames').value);
       cfg.subsequent_conf_threshold = parseFloat(document.getElementById('subsequent_conf_threshold').value) || 0;
       const vms = parseFloat(document.getElementById('track_validity_ms').value);
-      cfg.track_validity_ms = isNaN(vms) ? 500 : vms;
+      cfg.track_validity_ms = isNaN(vms) ? 200 : vms;
       const ps = parseFloat(document.getElementById('position_smoothing').value);
       cfg.position_smoothing = isNaN(ps) ? 0.25 : Math.min(Math.max(ps, 0), 1);   // 0 is valid (raw)
       const ag = parseFloat(document.getElementById('track_agility').value);
