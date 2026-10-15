@@ -34,7 +34,7 @@ Tested on a Meteor Lake 155H (NPU + iGPU), holds ~20 FPS.
 - **No auth.** Trusted-LAN only — don't expose port 8777 to the internet.
 - **Bad WiFi = a laggy dot.** The dot is exactly the backend's Kalman output with zero client-side smoothing, so a weak link makes it stutter, freeze, and jump. The polling fallback only kicks in if the browser can't do EventSource at all.
 - **Calibration is snapshot-based.** You draw geometry on a still frame, not live — move the camera and you re-draw.
-- **Some assembly required.** x86 Linux + Docker; the model IR isn't in the image (generate/mount it in `/data/models`) and the Intel NPU/GPU runtimes get pulled at build time.
+- **Some assembly required.** x86 Linux + Docker; the Intel NPU/GPU runtimes get pulled at image build time, and the YOLO weights are downloaded once on first start (needs internet that once — set `HALO_WEIGHTS` to build offline).
 - **It can be fooled.** YOLO26m is excellent and worth the AGPL3 license but haloween scenes can be chaotic, so filter with caution.
 - **Latency exists.** Tuned for low end-to-end delay, but camera + inference + network still add up. This is a best effort application with plenty of knobs to dial in the speed you want.
 
@@ -49,7 +49,7 @@ Then open **http://docker-host:8777** (that's the web UI) and:
 1. **Calibrate** on `/setup` — set the RTSP URL, grab a snapshot, draw the inclusion zone and base line, and set the threshold. Name and tune Outputs 2-8 here too.
 2. **Start the engine** from `/execute` (or tick *Auto-start engine on boot* on `/setup`). Nothing fires automatically until it's running — the manual output buttons work regardless.
 3. **Flash the ESP32** — paste `esp32/firmware.cpp` into the Arduino IDE (ESP32 core), set your WiFi SSID/password, and flash. It serves its own control page on port 80 and talks to the backend on TCP 5000 (UDP discovery on 5001). Pin map is in [ESP32 wiring](#esp32-wiring) below.
-4. **Model** — the backend loads the OpenVINO IR from `/data/models/yolo26m`. Build it with `build_model.py`, or drop `yolo26m.pt` in `/data/models` and it converts on first load.
+4. **Model** — nothing to do. The backend loads the IR from `/data/models/yolo26m`; if it's missing it downloads `yolo26m.pt` once, builds the 640×640 FP16 IR into `/data/models/yolo26m`, then discards the weights (only the `.xml`/`.bin` persist). Set `HALO_WEIGHTS` to build from a local `.pt` instead (offline).
 
 Hardware is cheap and easy if you already have an Intel inference box: 1x ESP32, 1x darlington array,
 and 1-2x 8-channel relay boards (one darlington collector can drive several relays). That
@@ -98,7 +98,7 @@ restart). Three groups: what the detector believes, how the dot moves, and what 
 
 **Triggers & outputs**
 - **Threshold point** + **threshold delay** — where the reverse logic arms, and how long after the cross it waits.
-- **Outputs 1–8** — trigger point, duration, depends-on-Main, max activations, reverse; plus **button names** for 2–8 (Main always reads "Main").
+- **Outputs 1–8** — enable/disable (2–8), trigger point, duration, depends-on-Main, max activations, reverse; plus **button names** for 2–8 (Main always reads "Main"). A disabled channel never fires and its button is hidden on `/execute`.
 
 ## Roadmap
 

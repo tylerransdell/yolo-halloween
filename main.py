@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -134,14 +135,16 @@ DEFAULT_CONFIG = {
     "threshold_point": 50.0,
     "threshold_delay": 5.0,  # seconds after the threshold cross before reverse logic activates
     "outputs": {
-        "1": {"trigger": 15.0, "duration": 180, "depends": False, "max_act": 1, "reverse": False},
-        "2": {"trigger": 40.0, "duration": 8, "depends": True, "max_act": 1, "reverse": False},
-        "3": {"trigger": 60.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
-        "4": {"trigger": 70.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
-        "5": {"trigger": 80.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
-        "6": {"trigger": 85.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
-        "7": {"trigger": 90.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False},
-        "8": {"trigger": 20.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": True},
+        # "enabled" hides the channel on /execute and stops it firing (Main's flag is ignored --
+        # Main is always active). Missing key is treated as enabled, so old configs migrate.
+        "1": {"trigger": 15.0, "duration": 180, "depends": False, "max_act": 1, "reverse": False, "enabled": True},
+        "2": {"trigger": 40.0, "duration": 8, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "3": {"trigger": 60.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "4": {"trigger": 70.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "5": {"trigger": 80.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "6": {"trigger": 85.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "7": {"trigger": 90.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
+        "8": {"trigger": 20.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": True, "enabled": True},
     }
 }
 
@@ -202,22 +205,40 @@ ov_compiled_model = None
 ov_input_layer = None
 
 def _find_weights():
-    """Locate the YOLO26m .pt weights used to (re)build the OpenVINO IR."""
-    candidates = []
+    """Return the user-supplied YOLO26m weights (``HALO_WEIGHTS``), if any.
+
+    The .pt is only ever a BUILD INPUT -- we never expect it to live in /data, the repo, or
+    the image. So this is just the explicit offline escape hatch; everything else is
+    downloaded on demand from the Ultralytics asset release.
+    """
     env = os.environ.get("HALO_WEIGHTS")
-    if env:
-        candidates.append(env)
-    candidates += [
-        os.path.join(MODEL_DIR, f"{MODEL_NAME}.pt"),
-        os.path.join("/app", f"{MODEL_NAME}.pt"),
-        os.path.join("/models", f"{MODEL_NAME}.pt"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{MODEL_NAME}.pt"),
-        f"{MODEL_NAME}.pt",
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
+    if env and os.path.exists(env):
+        return env
     return None
+
+def _obtain_weights():
+    """Return ``(path, is_temp)`` for a .pt to (re)build the IR from.
+
+    Prefers ``HALO_WEIGHTS`` (a user file -- never deleted). Otherwise downloads
+    ``yolo26m.pt`` into a throwaway temp dir: the weights are consumed once and then
+    discarded, so they must NOT persist in /data next to the IR we actually load.
+    """
+    local = _find_weights()
+    if local:
+        return local, False
+    tmp = tempfile.mkdtemp(prefix="halo-weights-")
+    dst = os.path.join(tmp, f"{MODEL_NAME}.pt")
+    print(f"[model] IR missing -> downloading {MODEL_NAME}.pt ...", flush=True)
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset  # lazy: build-only dep
+        attempt_download_asset(dst)
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"could not download {MODEL_NAME}.pt: {e}")
+    if not os.path.exists(dst):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"could not download {MODEL_NAME}.pt (no file at {dst})")
+    return dst, True
 
 def build_openvino_model():
     """Export YOLO26m to a 640x640 FP16 OpenVINO IR (no e2e/Top-K nodes).
@@ -228,34 +249,37 @@ def build_openvino_model():
     CPU postprocess it would remove costs ~0.01 ms/frame. See build_model.py for the CLI.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
-    weights = _find_weights()
-    if not weights:
-        print(f"[model] Weights '{MODEL_NAME}.pt' not found; set HALO_WEIGHTS or drop it in {MODEL_DIR}.")
-        return False
-    print(f"[model] Building {MODEL_NAME} OpenVINO IR ({MODEL_IMGSZ}x{MODEL_IMGSZ}, FP16, end2end=False)...")
-    from ultralytics import YOLO  # lazy import: torch is only needed to (re)build the model
-    model = YOLO(weights)
-    export_path = model.export(
-        format="openvino",
-        imgsz=MODEL_IMGSZ,
-        dynamic=False,
-        quantize=16,     # FP16 weights (compress_to_fp16)
-        batch=1,
-        nms=False,       # keep raw logits (no embedded NMS)
-        end2end=False,   # strip the YOLO26 Top-K/Gather/NMS head -> NPU friendly
-    )
-    src_dir = os.path.dirname(str(export_path))
-    for ext in (".xml", ".bin"):
-        src = os.path.join(src_dir, f"{MODEL_NAME}{ext}")
-        if not os.path.exists(src):
-            matches = glob.glob(os.path.join(src_dir, f"*{ext}"))
-            src = matches[0] if matches else src
-        dst = os.path.join(MODEL_DIR, f"{MODEL_NAME}{ext}")
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
+    weights, is_temp = _obtain_weights()
+    try:
+        print(f"[model] Building {MODEL_NAME} OpenVINO IR ({MODEL_IMGSZ}x{MODEL_IMGSZ}, FP16, end2end=False)...", flush=True)
+        from ultralytics import YOLO  # lazy import: torch is only needed to (re)build the model
+        model = YOLO(weights)
+        export_path = model.export(
+            format="openvino",
+            imgsz=MODEL_IMGSZ,
+            dynamic=False,
+            quantize=16,     # FP16 weights (compress_to_fp16)
+            batch=1,
+            nms=False,       # keep raw logits (no embedded NMS)
+            end2end=False,   # strip the YOLO26 Top-K/Gather/NMS head -> NPU friendly
+        )
+        src_dir = os.path.dirname(str(export_path))
+        for ext in (".xml", ".bin"):
+            src = os.path.join(src_dir, f"{MODEL_NAME}{ext}")
+            if not os.path.exists(src):
+                matches = glob.glob(os.path.join(src_dir, f"*{ext}"))
+                src = matches[0] if matches else src
+            dst = os.path.join(MODEL_DIR, f"{MODEL_NAME}{ext}")
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+    finally:
+        if is_temp:
+            # .pt + its export dir are throwaway -- only the IR in MODEL_DIR is kept.
+            shutil.rmtree(os.path.dirname(weights), ignore_errors=True)
+            print("[model] discarded downloaded weights", flush=True)
     xml_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}.xml")
     bin_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}.bin")
-    print(f"[model] Installed IR -> {xml_path}")
+    print(f"[model] Installed IR -> {xml_path}", flush=True)
     return os.path.exists(xml_path) and os.path.exists(bin_path)
 
 DEVICE_WARN_MSG = (
@@ -298,13 +322,15 @@ def initialize_openvino_model():
     bin_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}.bin")
 
     if not (os.path.exists(xml_path) and os.path.exists(bin_path)):
+        print(f"[model] IR not found in {MODEL_DIR}; building it now "
+              f"({MODEL_NAME}.pt is downloaded if needed, then discarded)...", flush=True)
         try:
             build_openvino_model()
         except Exception as e:
-            print(f"[model] Build failed: {e}")
+            print(f"[model] Build failed: {e}", flush=True)
 
     if not os.path.exists(xml_path):
-        print("[model] OpenVINO IR unavailable; inference disabled until the model is present.")
+        print("[model] OpenVINO IR unavailable; inference disabled until the model is present.", flush=True)
         ov_compiled_model = None
         state.model_loaded = False
         state.model_device = "NONE"
@@ -600,6 +626,8 @@ async def _eval_forward_outputs(positions: List[float], now: float):
     for ch in range(2, 9):
         ch_str = str(ch)
         c_cfg = cfg_outputs[ch_str]
+        if not c_cfg.get("enabled", True):
+            continue  # channel disabled on /setup
         if c_cfg["reverse"]:
             continue  # reverse outputs are handled by their own evaluator
         if state.output_states[ch_str] == 1:
@@ -628,6 +656,8 @@ async def _eval_reverse_outputs(cur_max, now: float):
     for ch in range(2, 9):
         ch_str = str(ch)
         c_cfg = cfg_outputs[ch_str]
+        if not c_cfg.get("enabled", True):
+            continue  # channel disabled on /setup
         if not c_cfg["reverse"]:
             continue
         if state.output_states[ch_str] == 1:
@@ -1565,6 +1595,7 @@ EXECUTE_HTML = """
       for (let i = 1; i <= 8; i++) {
         const o = outs[i.toString()];
         if (!o) continue;
+        if (i >= 2 && o.enabled === false) continue;   // disabled channels hidden on /execute
         const x = xOf(o.trigger);
         const active = (data.output_states || {})[i.toString()] === 1;
         ctx.strokeStyle = active ? '#16a34a' : (i === 1 ? '#f59e0b' : '#334155');
@@ -1606,11 +1637,15 @@ EXECUTE_HTML = """
       grid.innerHTML = html;
       outputsBuilt = true;
     }
-    function updateOutputsGrid(states) {
+    function updateOutputsGrid(states, outputs) {
       ensureOutputsGrid();
       for (let i = 1; i <= 8; i++) {
         const btn = document.getElementById('outBtn' + i);
         if (!btn) continue;
+        // Main is always shown; outputs 2-8 are hidden while disabled on /setup.
+        const enabled = (i === 1) || ((outputs[String(i)] || {}).enabled !== false);
+        btn.style.display = enabled ? '' : 'none';
+        if (!enabled) continue;
         const name = (i === 1) ? "Main" : (outputNames[`out_${i}`] || `Output ${i}`);
         if (btn.textContent !== name) btn.textContent = name;
         btn.classList.toggle('active', states[String(i)] === 1);
@@ -1667,7 +1702,7 @@ EXECUTE_HTML = """
         setTxt('esp32Cmd', data.last_command || '-');
         setTxt('esp32Resp', data.last_response || '-');
 
-        updateOutputsGrid(data.output_states || {});
+        updateOutputsGrid(data.output_states || {}, data.outputs || {});
     }
     async function updateStatus() {
       try { applyStatus(await (await fetch('/api/status')).json()); }
@@ -1976,6 +2011,7 @@ SETUP_HTML = """
         html += `
           <div style="border-top: 1px solid #334155; margin-top: 10px; padding-top: 10px;">
             <h4>Output ${i}</h4>
+            <label><input type="checkbox" id="out_${i}_enabled" ${o.enabled !== false ? 'checked' : ''}> Enabled (fires &amp; shows on Execute page)</label>
             <label>Button Name (shown on Execute page)</label>
             <input type="text" id="out_${i}_name" value="${escAttr(nm)}" placeholder="Output ${i}">
             <label>Trigger Position</label>
@@ -2041,7 +2077,8 @@ SETUP_HTML = """
           duration: parseFloat(document.getElementById(`out_${i}_duration`).value),
           depends: reverse ? true : document.getElementById(`out_${i}_depends`).checked,
           max_act: parseInt(document.getElementById(`out_${i}_max`).value),
-          reverse: reverse
+          reverse: reverse,
+          enabled: document.getElementById(`out_${i}_enabled`).checked
         };
         cfg.output_names[`out_${i}`] = document.getElementById(`out_${i}_name`).value.trim() || `Output ${i}`;
       }
