@@ -1,7 +1,7 @@
-# YOLO-halloween
+# YOLO-Halloween
 
-A working-prototype Halloween trigger engine. Point a camera at your walkway, it watches
-people move through, and it trips relays as they hit your marks. Two pieces:
+An early-development Halloween trigger engine with numerous features. Point a camera at your
+walkway, it watches people move through, and it trips relays as they hit your marks. Two pieces:
 
 1. **ESP32 firmware** — a tiny control app, an API, and UDP discovery. This is what actually drives the relays.
 2. **Docker backend** — Intel-optimized YOLO26m (OpenVINO) doing the detection, plus the tracking logic and web UI that decide when to poke the ESP32.
