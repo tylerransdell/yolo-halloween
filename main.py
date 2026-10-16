@@ -145,7 +145,30 @@ DEFAULT_CONFIG = {
         "6": {"trigger": 85.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
         "7": {"trigger": 90.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": False, "enabled": True},
         "8": {"trigger": 20.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": True, "enabled": True},
-    }
+    },
+    # WLED (optional): drive an addressable LED run as a live "position line" over DDP.
+    # OFF = one static color/brightness; ON = a scene ("follower" = dark holes that track
+    # people, or "solid"). Ships ENABLED but inert until "ip" is set (no IP -> nothing sent).
+    # These are the tuned values; only the IP is site-specific. See the WLED section below.
+    "wled": {
+        "enabled": True,
+        "ip": "",                    # <= set YOUR WLED's IP (or do it on /setup); blank = idle
+        "port": 4048,                # DDP UDP port (WLED listens here)
+        "refresh_hz": 15,            # frame cadence; also keeps WLED in realtime mode
+        "off_color": [204, 51, 0],   # deep orange-red (#CC3300) while Main is OFF
+        "off_brightness": 50,        # percent (0-100)
+        "on_color": [128, 0, 0],     # deep red (#800000) while Main is ON
+        "on_brightness": 50,         # percent (0-100)
+        "scene": "follower",         # "follower" (dark holes) | "solid"
+        # Up to 4 segments: each is a run of pixels along the line. The 3 calibration points
+        # are (pixel_number, line_position): first pixel, a mid pixel, and the last pixel ->
+        # quadratic fit pos = f(pixel), inverted per person. No direction handling here --
+        # WLED's own segment "reverse" checkbox owns physical orientation. The line positions
+        # are NOT limited to 0-100: /setup shows the real span for your geometry.
+        "segments": [
+            {"num_pixels": 214, "first_pos": 0.0, "last_pos": 100.0, "mid_pixel": 101, "mid_pos": 50.0},
+        ],
+    },
 }
 
 def load_config():
@@ -197,6 +220,12 @@ class RuntimeState:
         self.device_warning = ""
         self.reverse_armed = False        # latch: reverse outputs armed (Main active + all past threshold)
         self.prev_max_position = None     # previous frame's highest position (for reverse crossing)
+        # --- WLED telemetry (optional feature; see the WLED section) ---
+        self.wled_enabled = False
+        self.wled_ip = None
+        self.wled_frames_sent = 0
+        self.wled_fps = 0.0
+        self.wled_last_error = ""
 
 state = RuntimeState()
 
@@ -578,6 +607,364 @@ async def send_esp32_command(channel: int, op_state: int, connect_timeout: float
     dispatcher task performs the actual network exchange."""
     queue_esp32_command(channel, op_state)
     return True
+
+# --- WLED (optional): drive an addressable run over DDP (UDP 4048) ---
+# Sends ONE contiguous RGB frame covering all segments concatenated. Calibration maps the app's
+# normalized 0-100 line position <-> pixel index with a quadratic through three user points, so
+# non-uniform physical spacing is handled (deliberately NOT a linear mapping: 30 app units near
+# one end can be 30 ft while 30 units near the other can be 50 ft). While Main is OFF the run
+# shows one static color/brightness; while Main is ON it renders the selected scene
+# ("follower" = dark holes that track people, or "solid"). Purely additive; off by default.
+WLED_DDP_PORT = 4048
+WLED_MAX_DATALEN = 1440        # DDP max data bytes/packet (480 RGB pixels -> fits an ethernet MTU)
+WLED_ID_DISPLAY = 1            # DDP_ID_DISPLAY
+WLED_MAX_SEGMENTS = 4
+# Follower band geometry, in PIXELS from a person's centre pixel (fixed). Levels are fractions of
+# the user's ON brightness -- deliberately low and non-linear, because perceived brightness is not
+# linear in value: a 25/50/75 ramp reads as barely dimmed, while these read as a real falloff.
+#   dist <= 2 -> dark (0%), then each 2-pixel ring: 15%, 20%, 30%, 60% -> full beyond 10 px.
+WLED_DARK_PIXELS = 2
+WLED_BAND_STEP = 2
+WLED_BAND_LEVELS = (0.0, 0.15, 0.20, 0.30, 0.60)
+WLED_BAND_EPS = 1e-6   # tolerance so an exact band edge isn't flipped by float noise
+_wled_sock = None
+
+
+def wled_cfg():
+    """The ``wled`` config block with defaults filled in (so old configs migrate cleanly)."""
+    d = DEFAULT_CONFIG["wled"]
+    raw = config.get("wled")
+    if not isinstance(raw, dict):
+        raw = {}
+    merged = dict(d)
+    merged.update(raw)
+    if not isinstance(merged.get("segments"), list) or not merged["segments"]:
+        merged["segments"] = [dict(s) for s in d["segments"]]
+    return merged
+
+
+def wled_fit_segment(seg):
+    """Fit ``pos = a*i^2 + b*i + c`` through one segment's 3 calibration points.
+
+    Points are (0, first_pos), (mid_pixel, mid_pos), (n-1, last_pos): the line position of the
+    run's first pixel, a mid pixel, and its last pixel. Direction needs no special handling --
+    a physically reversed run simply yields a curve that decreases with ``i`` (WLED's own
+    segment "reverse" checkbox owns physical orientation). Returns (a, b, c, n) or None.
+    """
+    try:
+        n = int(seg.get("num_pixels", 0))
+    except (TypeError, ValueError):
+        return None
+    if n < 2:
+        return None
+    try:
+        mid_i = min(max(int(seg.get("mid_pixel")), 1), max(1, n - 2))
+    except (TypeError, ValueError):
+        return None
+    try:
+        p_first = float(seg.get("first_pos"))
+        p_mid = float(seg.get("mid_pos"))
+        p_last = float(seg.get("last_pos"))
+    except (TypeError, ValueError):
+        return None
+    a, b, c = (float(v) for v in np.polyfit([0.0, float(mid_i), float(n - 1)],
+                                            [p_first, p_mid, p_last], 2))
+    if abs(a) < 1e-9:
+        a = 0.0                     # (near-)linear calibration -> exact linear solve later
+    return a, b, c, n
+
+
+def wled_position_to_pixel(pos, fit):
+    """Pixel index for a person at line position ``pos`` (inverse of the segment's quadratic).
+
+    Solves ``a*i^2 + b*i + (c - pos) = 0``, picks the in-range root and clamps to [0, n-1].
+    A (near-)linear calibration uses the linear solve. If the curve never reaches ``pos``
+    within the run, the nearest END pixel is returned so edge people still shade the end.
+    """
+    a, b, c, n = fit
+    target = c - float(pos)
+    roots = []
+    if abs(a) < 1e-12:
+        if abs(b) > 1e-12:
+            roots.append(-target / b)
+    else:
+        disc = b * b - 4.0 * a * target
+        if disc >= 0.0:
+            sq = float(np.sqrt(disc))
+            roots.append((-b + sq) / (2.0 * a))
+            roots.append((-b - sq) / (2.0 * a))
+    if not roots:
+        f0 = c
+        fn = a * (n - 1) ** 2 + b * (n - 1) + c
+        return 0.0 if abs(f0 - pos) <= abs(fn - pos) else float(n - 1)
+    in_range = [r for r in roots if -0.5 <= r <= (n - 1) + 0.5]
+    pick = in_range[0] if in_range else min(roots, key=lambda r: abs(r - (n - 1) / 2.0))
+    return float(min(max(pick, 0.0), float(n - 1)))
+
+
+def wled_segment_fits(wled):
+    """Usable segments (as fits) in order, capped at WLED_MAX_SEGMENTS."""
+    fits = []
+    for seg in (wled.get("segments") or [])[:WLED_MAX_SEGMENTS]:
+        if isinstance(seg, dict):
+            fit = wled_fit_segment(seg)
+            if fit:
+                fits.append(fit)
+    return fits
+
+
+def wled_total_pixels(wled):
+    """Total pixel count across all usable segments (the DDP frame's pixel length)."""
+    return sum(f[3] for f in wled_segment_fits(wled))
+
+
+def wled_multipliers(positions, wled):
+    """Per-pixel brightness multipliers (0..1) across every pixel of every segment.
+
+    Each person darkens the pixels over them and opens a dimmer ring to either side; overlaps
+    keep the DARKER value (np.minimum) so two nearby people never brighten each other's hole.
+    """
+    fits = wled_segment_fits(wled)
+    total = sum(f[3] for f in fits)
+    out = np.ones(total, dtype=np.float64)
+    if total == 0 or not positions:
+        return out
+    offset = 0
+    for fit in fits:
+        idx = np.arange(fit[3], dtype=np.float64)
+        for pos in positions:
+            centre = wled_position_to_pixel(pos, fit)
+            dist = np.abs(idx - centre)
+            band = np.ones(fit[3], dtype=np.float64)
+            band[dist <= WLED_DARK_PIXELS + WLED_BAND_EPS] = WLED_BAND_LEVELS[0]
+            for k, level in enumerate(WLED_BAND_LEVELS[1:], start=1):
+                lo = WLED_DARK_PIXELS + (k - 1) * WLED_BAND_STEP
+                band[(dist > lo + WLED_BAND_EPS) & (dist <= lo + WLED_BAND_STEP + WLED_BAND_EPS)] = level
+            out[offset:offset + fit[3]] = np.minimum(out[offset:offset + fit[3]], band)
+        offset += fit[3]
+    return out
+
+
+# --- WLED frame building / DDP transport ---
+def _rgb255(color):
+    try:
+        r, g, b = (int(round(float(x))) for x in color)
+    except (TypeError, ValueError):
+        return 0, 0, 0
+    return (min(max(r, 0), 255), min(max(g, 0), 255), min(max(b, 0), 255))
+
+
+def _pct_to_scale(v):
+    """Brightness percent (0-100) -> 0.0-1.0."""
+    try:
+        return min(max(float(v), 0.0), 100.0) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pct_int(v):
+    try:
+        return int(round(min(max(float(v), 0.0), 100.0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def wled_build_frame(wled, positions=None, main_active=False):
+    """RGB byte buffer (3 bytes/pixel, all segments concatenated) for one DDP frame.
+
+    Main OFF -> every pixel = off_color at off_brightness (static).
+    Main ON  -> the selected scene at on_color/on_brightness: "solid" is uniform, "follower"
+                dims each pixel by its track-hole multiplier.
+    """
+    total = wled_total_pixels(wled)
+    if total <= 0:
+        return b""
+
+    if not main_active:
+        r, g, b = _rgb255(wled.get("off_color"))
+        s = _pct_to_scale(wled.get("off_brightness"))
+        return bytes([int(r * s), int(g * s), int(b * s)]) * total
+
+    r, g, b = _rgb255(wled.get("on_color"))
+    s = _pct_to_scale(wled.get("on_brightness"))
+    scene = str(wled.get("scene") or "follower").lower()
+    if scene == "solid":
+        # A scene may ignore the color picker entirely; this one honors it.
+        return bytes([int(r * s), int(g * s), int(b * s)]) * total
+
+    mult = wled_multipliers(positions or [], wled)
+    frame = bytearray(total * 3)
+    for i in range(total):
+        m = s * float(mult[i]) if i < len(mult) else s
+        frame[3 * i] = int(r * m)
+        frame[3 * i + 1] = int(g * m)
+        frame[3 * i + 2] = int(b * m)
+    return bytes(frame)
+
+
+def wled_ddp_packets(frame):
+    """Split an RGB buffer into DDP datagrams (<=1440 data bytes each), PUSH on the last.
+
+    Header is the 10-byte DDP record: flags1, flags2(seq), type, id, offset[4 BE], len[2 BE].
+    flags1 = 0x40 (version 1) | 0x01 (PUSH); type = 0x01 (RGB8); id = 1 (DDP_ID_DISPLAY).
+    Chunks are written without PUSH and only the final one pushes, so a multi-packet frame
+    shows once instead of tearing.
+    """
+    packets = []
+    total = len(frame)
+    offset = 0
+    seq = 0
+    while offset < total:
+        chunk = frame[offset:offset + WLED_MAX_DATALEN]
+        seq = (seq % 255) + 1
+        last = (offset + len(chunk)) >= total
+        header = bytes([
+            (0x41 if last else 0x40), seq, 0x01, WLED_ID_DISPLAY,
+            (offset >> 24) & 0xFF, (offset >> 16) & 0xFF, (offset >> 8) & 0xFF, offset & 0xFF,
+            (len(chunk) >> 8) & 0xFF, len(chunk) & 0xFF,
+        ])
+        packets.append(header + chunk)
+        offset += len(chunk)
+    return packets
+
+
+def _wled_send_sync(ip, port, packets):
+    """Blocking UDP send (always used via asyncio.to_thread, so it never touches the loop)."""
+    global _wled_sock
+    if _wled_sock is None:
+        _wled_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for pkt in packets:
+        _wled_sock.sendto(pkt, (ip, port))
+    return len(packets)
+
+
+async def wled_send_frame(wled, positions, main_active):
+    """Build + send one DDP frame. Returns True if a frame was sent (never raises upward)."""
+    ip = str(wled.get("ip") or "").strip()
+    if not ip:
+        return False
+    frame = wled_build_frame(wled, positions, main_active)
+    if not frame:
+        return False
+    try:
+        port = int(wled.get("port", WLED_DDP_PORT) or WLED_DDP_PORT)
+    except (TypeError, ValueError):
+        port = WLED_DDP_PORT
+    await asyncio.to_thread(_wled_send_sync, ip, port, wled_ddp_packets(frame))
+    return True
+
+
+# --- WLED worker + config normalization ---
+async def wled_worker():
+    """Stream DDP frames at the configured cadence, fully decoupled from inference.
+
+    Runs even while the engine is stopped (Main OFF), so WLED stays in realtime showing the OFF
+    color instead of reverting to its own preset. Errors are swallowed (rate-limited to one log
+    line each) so a misconfigured / unreachable WLED can never stall or spam the app.
+    """
+    last_err = ""
+    last_sent_at = None
+    while True:
+        wled = wled_cfg()
+        state.wled_enabled = bool(wled.get("enabled"))
+        state.wled_ip = str(wled.get("ip") or "").strip() or None
+        if not state.wled_enabled or not state.wled_ip:
+            state.wled_fps = 0.0
+            await asyncio.sleep(0.5)
+            continue
+        try:
+            hz = min(max(float(wled.get("refresh_hz", 30)), 1.0), 120.0)
+        except (TypeError, ValueError):
+            hz = 30.0
+        try:
+            if await wled_send_frame(wled, state.detected_persons, state.main_active):
+                state.wled_frames_sent += 1
+                if last_err:
+                    last_err, state.wled_last_error = "", ""
+                # Rate from the actual loop cadence (send + sleep). Measuring just the send
+                # time would be meaningless: UDP returns in well under a millisecond.
+                now_t = time.time()
+                if last_sent_at is not None and now_t > last_sent_at:
+                    inst = 1.0 / (now_t - last_sent_at)
+                    state.wled_fps = round(inst if not state.wled_fps else state.wled_fps * 0.8 + inst * 0.2, 1)
+                last_sent_at = now_t
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"[:120]
+            state.wled_last_error = msg
+            if msg != last_err:
+                last_err = msg
+                print(f"[wled] send error: {msg}", flush=True)
+            await asyncio.sleep(0.5)
+            continue
+        await asyncio.sleep(1.0 / hz)
+
+
+def _wled_status():
+    """Compact WLED telemetry for the UI (colors/scene let /execute show a live swatch)."""
+    w = wled_cfg()
+    return {
+        "enabled": bool(w.get("enabled")),
+        "ip": str(w.get("ip") or "").strip() or None,
+        "port": int(w.get("port", WLED_DDP_PORT) or WLED_DDP_PORT),
+        "fps": state.wled_fps,
+        "frames_sent": state.wled_frames_sent,
+        "last_error": state.wled_last_error,
+        "scene": w.get("scene"),
+        "off_color": w.get("off_color"),
+        "on_color": w.get("on_color"),
+        "off_brightness": w.get("off_brightness"),
+        "on_brightness": w.get("on_brightness"),
+    }
+
+
+def _normalize_wled(w):
+    """Sanitize a user-supplied ``wled`` block (from /api/config) into a known-good shape."""
+    out = dict(w)
+    out["enabled"] = bool(w.get("enabled", False))
+    out["ip"] = str(w.get("ip") or "").strip()
+    try:
+        out["port"] = min(max(int(w.get("port", WLED_DDP_PORT)), 1), 65535)
+    except (TypeError, ValueError):
+        out["port"] = WLED_DDP_PORT
+    try:
+        out["refresh_hz"] = min(max(float(w.get("refresh_hz", 30)), 1.0), 120.0)
+    except (TypeError, ValueError):
+        out["refresh_hz"] = 30.0
+    out["scene"] = "solid" if str(w.get("scene") or "").lower() == "solid" else "follower"
+    defaults = DEFAULT_CONFIG["wled"]
+    out["off_color"] = list(_rgb255(w.get("off_color") or defaults["off_color"]))
+    out["on_color"] = list(_rgb255(w.get("on_color") or defaults["on_color"]))
+    out["off_brightness"] = _pct_int(w.get("off_brightness", defaults["off_brightness"]))
+    out["on_brightness"] = _pct_int(w.get("on_brightness", defaults["on_brightness"]))
+    segs = w.get("segments")
+    norm = []
+    if isinstance(segs, list):
+        for s in segs[:WLED_MAX_SEGMENTS]:
+            if isinstance(s, dict):
+                norm.append(_normalize_wled_seg(s))
+    if not norm:
+        norm = [dict(defaults["segments"][0])]
+    out["segments"] = norm
+    return out
+
+
+def _normalize_wled_seg(s):
+    """Clamp one segment's numeric fields into sane ranges (keeps bad input harmless)."""
+    def num(key, default, lo, hi, is_int=False):
+        try:
+            x = min(max(float(s.get(key, default)), lo), hi)
+        except (TypeError, ValueError):
+            x = float(default)
+        return int(round(x)) if is_int else round(x, 3)
+    n = num("num_pixels", 100, 2, 100000, is_int=True)
+    return {
+        "num_pixels": n,
+        "first_pos": num("first_pos", 0.0, -100000.0, 100000.0),
+        "last_pos": num("last_pos", 100.0, -100000.0, 100000.0),
+        "mid_pixel": min(max(num("mid_pixel", n // 2, 1, max(1, n - 2), is_int=True), 1), max(1, n - 2)),
+        "mid_pos": num("mid_pos", 50.0, -100000.0, 100000.0),
+    }
+
 
 # --- SPATIAL MATH & POLYGON FILTERING ---
 def evaluate_point_against_polygons(pt_norm, frame_w, frame_h, cfg):
@@ -1326,6 +1713,7 @@ async def startup_event():
     asyncio.create_task(esp32_dispatch_loop())
     asyncio.create_task(output_expiry_loop())
     asyncio.create_task(inference_worker())
+    asyncio.create_task(wled_worker())
     asyncio.create_task(_boot_sequence())
 
 # --- API ENDPOINTS ---
@@ -1359,6 +1747,7 @@ def _status_payload():
         "base_line": config.get("base_line", {"p1": [0, 0], "p2": [100, 0]}),
         "threshold_point": config.get("threshold_point", 50.0),
         "outputs": config.get("outputs", {}),
+        "wled": _wled_status(),
     }
 
 @app.get("/api/status")
@@ -1423,6 +1812,10 @@ async def update_config(new_config: dict):
     for o in (new_config.get("outputs") or {}).values():
         if isinstance(o, dict) and o.get("reverse"):
             o["depends"] = True
+    # Normalize the optional WLED block (clamp counts/brightness, cap segments at 4) so the
+    # worker and frame builder only ever see sane values, whatever the UI sends.
+    if isinstance(new_config.get("wled"), dict):
+        new_config["wled"] = _normalize_wled(new_config["wled"])
     prev_device = config.get("device_priority")
     config = new_config
     save_config(config)
@@ -1454,6 +1847,29 @@ async def esp32_test():
     return {"reachable": ok, "ip": ip, "port": int(config.get("esp32_tcp_port", 5000)), "ms": ms,
             "error": "" if ok else (state.last_response or "no response")}
 
+@app.get("/api/wled/test")
+async def wled_test():
+    """Fire one real DDP frame at the configured WLED IP so the user can confirm it lands.
+
+    DDP is fire-and-forget UDP, so this reports "sent" (no error), not a verified ack --
+    the WLED IP must be correct and Realtime/DDP receive enabled on the strip's end.
+    """
+    wled = wled_cfg()
+    ip = str(wled.get("ip") or "").strip()
+    if not ip:
+        return {"sent": False, "ip": None, "error": "no WLED IP configured"}
+    t0 = time.time()
+    try:
+        ok = await wled_send_frame(wled, state.detected_persons, state.main_active)
+    except Exception as e:
+        ok = False
+        state.wled_last_error = f"{type(e).__name__}: {e}"[:120]
+    ms = round((time.time() - t0) * 1000.0, 1)
+    return {"sent": ok, "ip": ip, "port": int(wled.get("port", WLED_DDP_PORT)),
+            "ms": ms, "frames_sent": state.wled_frames_sent,
+            "error": "" if ok else (state.wled_last_error or "send failed")}
+
+
 @app.post("/api/geometry")
 async def update_geometry(payload: dict):
     """Save just the calibration geometry (no model reload)."""
@@ -1469,6 +1885,10 @@ async def update_geometry(payload: dict):
     return {"status": "saved"}
 
 # --- HTML UI (`/execute` and `/setup`) ---
+# WLED defaults handed to the /setup form so its fallbacks match DEFAULT_CONFIG exactly
+# (single source of truth). Injected into the page at serve time; see setup_route().
+_WLED_JS_DEFAULTS = json.dumps(DEFAULT_CONFIG["wled"])
+
 EXECUTE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -1524,6 +1944,19 @@ EXECUTE_HTML = """
       </div>
     </div>
 
+    <div class="card" id="wledCard" style="display:none;">
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+        <div style="min-width: 0;">
+          <h3 style="margin: 0 0 4px 0;">WLED Lighting</h3>
+          <span id="wledState" style="font-size: 12px; color: #94a3b8; font-family: monospace;">...</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px; flex: 0 0 auto;">
+          <span id="wledTag" style="font-size: 11px; font-weight: bold; padding: 3px 7px; border-radius: 6px; background: #334155; color: #cbd5e1;">--</span>
+          <div id="wledSwatch" style="width: 40px; height: 40px; border-radius: 8px; border: 1px solid #475569; background: #0f172a;"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="display: flex; justify-content: space-between; align-items: center;">
       <div>
         <h3 style="margin: 0 0 4px 0;">OpenVINO Inference Time</h3>
@@ -1550,6 +1983,9 @@ EXECUTE_HTML = """
 
   <script>
     let outputNames = {};
+    const rgbHex = (c) => '#' + [0, 1, 2]
+      .map(i => Math.min(255, Math.max(0, parseInt((c || [])[i] || 0))).toString(16).padStart(2, '0'))
+      .join('');
     let engineRunning = false;
     async function toggleEngine() {
       const action = engineRunning ? 'stop' : 'start';
@@ -1701,6 +2137,46 @@ EXECUTE_HTML = """
         setTxt('esp32Ip', data.esp32_ip || data.esp32_host || '-');
         setTxt('esp32Cmd', data.last_command || '-');
         setTxt('esp32Resp', data.last_response || '-');
+
+        // WLED: show what is ACTUALLY being driven right now -- OFF vs ON, the color and
+        // brightness on the wire, the rate, and how many holes the follower is tracking.
+        const wl = data.wled || {};
+        const wc = document.getElementById('wledCard');
+        if (wc) {
+          wc.style.display = wl.enabled ? '' : 'none';
+          if (wl.enabled) {
+            const on = !!data.main_active;
+            const pct = on ? wl.on_brightness : wl.off_brightness;
+            const col = on ? wl.on_color : wl.off_color;
+            const tag = document.getElementById('wledTag');
+            if (tag) {
+              tag.textContent = !wl.ip ? 'NO IP' : (on ? 'MAIN ON' : 'MAIN OFF');
+              tag.style.background = !wl.ip ? '#78350f' : (on ? '#7f1d1d' : '#334155');
+              tag.style.color = !wl.ip ? '#fde68a' : (on ? '#fecaca' : '#cbd5e1');
+            }
+            const sw = document.getElementById('wledSwatch');
+            if (sw) {
+              sw.style.background = !wl.ip
+                ? 'repeating-linear-gradient(45deg, #1e293b, #1e293b 6px, #334155 6px, #334155 12px)'
+                : (col && typeof pct === 'number'
+                  ? `rgb(${Math.round(col[0] * pct / 100)},${Math.round(col[1] * pct / 100)},${Math.round(col[2] * pct / 100)})`
+                  : '#0f172a');
+            }
+            const st = document.getElementById('wledState');
+            if (st) {
+              if (!wl.ip) {
+                st.textContent = 'enabled, but no IP set - add it on /setup';
+              } else {
+                const people = (data.detected_persons || []).length;
+                const holes = (on && wl.scene === 'follower')
+                  ? `/${people} hole${people === 1 ? '' : 's'}` : '';
+                st.textContent = `${wl.ip}:${wl.port} | ${(wl.fps || 0).toFixed(0)} fps | ${wl.frames_sent || 0} frames`
+                  + ` | ${wl.scene || '-'}${holes} | sending ${rgbHex(col)} @${pct}%`
+                  + (wl.last_error ? ` | ERR ${wl.last_error}` : '');
+              }
+            }
+          }
+        }
 
         updateOutputsGrid(data.output_states || {}, data.outputs || {});
     }
@@ -1861,6 +2337,68 @@ SETUP_HTML = """
       <div id="outputsConfig"></div>
     </div>
 
+    <div class="card">
+      <h3>WLED Lighting (optional)</h3>
+      <div class="hint">Drives an addressable LED run as a live "position line" over <b>DDP</b>
+        (UDP 4048). On the WLED device: enable <b>Receive Realtime State</b> / Network DDP, set
+        transitions to <b>0 ms</b>, set <b>Realtime Timeout</b> to 2&ndash;3 s, and check
+        <b>Force Max Brightness in Realtime</b>. Pixel <b>0</b> is a run's first pixel; physical
+        direction is handled by WLED's own segment "reverse" checkbox.</div>
+      <label><input type="checkbox" id="wled_enabled" style="width:auto; margin-right:6px;"> Enable WLED output</label>
+      <label>WLED IP Address</label>
+      <input type="text" id="wled_ip" placeholder="192.168.1.x">
+      <div style="display:flex; gap:6px; align-items:center; margin-top:10px;">
+        <button type="button" class="tool" onclick="testWled()">Test / Send One Frame</button>
+        <span id="wledStatus" style="font-size:12px; color:#94a3b8; font-family:monospace;"></span>
+      </div>
+
+      <div style="border-top:1px solid #334155; margin-top:14px; padding-top:12px;">
+        <h4 style="margin:0 0 6px 0;">While Main is OFF</h4>
+        <label>Color</label>
+        <input type="color" id="wled_off_color" style="height:38px; padding:2px;">
+        <label>Brightness (%)</label>
+        <input type="number" id="wled_off_brightness" step="1" min="0" max="100">
+      </div>
+
+      <div style="border-top:1px solid #334155; margin-top:14px; padding-top:12px;">
+        <h4 style="margin:0 0 6px 0;">While Main is ON</h4>
+        <label>Scene</label>
+        <select id="wled_scene">
+          <option value="follower">Follower &mdash; dark holes track people</option>
+          <option value="solid">Solid &mdash; one uniform color</option>
+        </select>
+        <label>Color <span style="color:#64748b;">(a scene may ignore this)</span></label>
+        <input type="color" id="wled_on_color" style="height:38px; padding:2px;">
+        <label>Brightness (%)</label>
+        <input type="number" id="wled_on_brightness" step="1" min="0" max="100">
+        <label>Refresh Rate (Hz)</label>
+        <input type="number" id="wled_refresh_hz" step="1" min="1" max="120">
+      </div>
+
+      <div style="border-top:1px solid #334155; margin-top:14px; padding-top:12px;">
+        <h4 style="margin:0 0 6px 0;">Segments (pixel runs along the line)</h4>
+        <div class="hint">Up to 4. For each run enter its pixel count, the line position of its
+          <b>first pixel</b>, of its <b>last pixel</b>, and one <b>mid pixel</b> (number + position,
+          roughly mid-span). Those 3 points calibrate a quadratic pixel&harr;position map, so uneven
+          spacing is handled &mdash; it is <b>not</b> a linear fit.</div>
+        <div id="wledBounds" style="font-family:monospace; font-size:12px; color:#38bdf8; margin:2px 0 4px 0;"></div>
+        <div class="hint" style="margin-top:0;">That <b>line span</b> is the real range your base
+          line reports &mdash; it runs past 0/100 wherever the inclusion zone extends beyond the
+          line's ends, so positions are <b>not</b> fixed to 0-100. Use those two numbers for a
+          run's first/last pixel positions. If a run is wired the other way round, swap the two
+          (or let WLED's segment "reverse" handle it).</div>
+        <button type="button" class="tool" onclick="fillBoundsIntoSegments()">Set First/Last from line span</button>
+        <label>Number of Segments</label>
+        <select id="wled_num_segments" onchange="buildWledSegments()">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+        <div id="wledSegments"></div>
+      </div>
+    </div>
+
     <button class="save" onclick="saveConfig()">Save Configuration</button>
   </div>
 
@@ -1900,6 +2438,7 @@ SETUP_HTML = """
       snapCtx.beginPath(); snapCtx.arc(p.x, p.y, r || 4, 0, Math.PI * 2); snapCtx.fillStyle = color; snapCtx.fill();
     }
     function redraw() {
+      updateBoundsNote();   // geometry drives the real line span -> keep it current even pre-snapshot
       if (!snapCanvas.width) return;
       snapCtx.clearRect(0, 0, snapCanvas.width, snapCanvas.height);
       drawPoly(geo.inclusion, '#22c55e', 'rgba(34,197,94,0.15)');
@@ -1918,8 +2457,10 @@ SETUP_HTML = """
     function updateGeoStatus() {
       const inc = geo.inclusion.length ? 'set' : 'none';
       const ln = (geo.line.p1 && geo.line.p2) ? 'set' : 'none';
+      const b = lineBounds();
+      const span = b ? `${round1(b[0]).toFixed(1)}..${round1(b[1]).toFixed(1)}` : 'n/a';
       document.getElementById('geoStatus').textContent =
-        `Inclusion: ${inc} | Exclusions: ${geo.exclusions.length} | Base line: ${ln} | Threshold: ${document.getElementById('threshold_point').value}`;
+        `Inclusion: ${inc} | Exclusions: ${geo.exclusions.length} | Base line: ${ln} | Line span: ${span} | Threshold: ${document.getElementById('threshold_point').value}`;
     }
     snapCanvas.addEventListener('click', (e) => {
       if (!mode) return;
@@ -1979,6 +2520,122 @@ SETUP_HTML = """
     // Escape a user-entered name before injecting it into an HTML attribute.
     const escAttr = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
+    // ---- WLED lighting (optional) ----
+    let wledSegs = [];
+    const hexToRgb = (h) => {
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(h || ''));
+      if (!m) return [0, 0, 0];
+      const v = parseInt(m[1], 16);
+      return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+    };
+    const rgbToHex = (c) => '#' + [0, 1, 2]
+      .map(i => Math.min(255, Math.max(0, parseInt((c || [])[i] || 0))).toString(16).padStart(2, '0'))
+      .join('');
+    // WLED defaults, injected from the app's DEFAULT_CONFIG at serve time (__WLED_DEFAULTS__),
+    // so this form never hardcodes them. The typeof guard keeps the page alive if it is absent.
+    const WLED_DEFAULTS = (typeof __WLED_DEFAULTS__ !== 'undefined') ? __WLED_DEFAULTS__ : {};
+
+    // ---- WLED line-span bounds: the REAL position range the geometry can report ----
+    // A person's position is the perpendicular projection of their bottom-center onto the base
+    // line, so it is NOT clamped to 0-100: anywhere the inclusion zone extends past the line's
+    // ends reads negative or >100. Projection is linear, so the extremes are at the polygon's
+    // vertices. Falls back to the frame corners while no inclusion zone is drawn (nothing is
+    // gated out yet, so the whole frame can project). Mirrors main.py's project_to_baseline().
+    const round1 = (v) => Math.round(v * 10) / 10;
+    function lineBounds() {
+      const l = geo.line;
+      if (!l || !l.p1 || !l.p2) return null;
+      const bx = l.p2[0] - l.p1[0], by = l.p2[1] - l.p1[1];
+      const len2 = bx * bx + by * by;
+      if (len2 === 0) return null;
+      const pts = (Array.isArray(geo.inclusion) && geo.inclusion.length >= 3)
+        ? geo.inclusion : [[0, 0], [100, 0], [100, 100], [0, 100]];
+      let lo = Infinity, hi = -Infinity;
+      for (const p of pts) {
+        const v = (((p[0] - l.p1[0]) * bx + (p[1] - l.p1[1]) * by) / len2) * 100;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      return [lo, hi];
+    }
+    function updateBoundsNote() {
+      const el = document.getElementById('wledBounds');
+      if (!el) return;
+      const b = lineBounds();
+      if (!b) {
+        el.textContent = 'Line span: draw the base line (2 pts) to see the real range';
+        el.style.color = '#eab308';
+        return;
+      }
+      const gated = Array.isArray(geo.inclusion) && geo.inclusion.length >= 3;
+      el.textContent = `Line span: ${round1(b[0]).toFixed(1)}  ...  ${round1(b[1]).toFixed(1)}`
+        + (gated ? '   (from the inclusion zone)' : '   (whole frame - draw the inclusion zone for the real span)');
+      el.style.color = gated ? '#38bdf8' : '#eab308';
+    }
+    function harvestWledSegments() {
+      wledSegs = [];
+      for (let i = 0; i < 4; i++) {
+        const num = document.getElementById(`wled_seg_${i}_num`);
+        if (!num) break;
+        wledSegs.push({
+          num_pixels: parseInt(num.value) || 0,
+          first_pos: parseFloat(document.getElementById(`wled_seg_${i}_first`).value) || 0,
+          last_pos: parseFloat(document.getElementById(`wled_seg_${i}_last`).value) || 0,
+          mid_pixel: parseInt(document.getElementById(`wled_seg_${i}_midpx`).value) || 0,
+          mid_pos: parseFloat(document.getElementById(`wled_seg_${i}_midpos`).value) || 0
+        });
+      }
+    }
+    function fillBoundsIntoSegments() {
+      const b = lineBounds();
+      if (!b) { alert('Draw the base line first (and the inclusion zone) so the line span is known.'); return; }
+      const n = Math.min(Math.max(parseInt(document.getElementById('wled_num_segments').value) || 1, 1), 4);
+      for (let i = 0; i < n; i++) {
+        const f = document.getElementById(`wled_seg_${i}_first`);
+        const l = document.getElementById(`wled_seg_${i}_last`);
+        if (f) f.value = round1(b[0]);
+        if (l) l.value = round1(b[1]);
+      }
+      harvestWledSegments();
+    }
+    // ---- end WLED line-span bounds ----
+    function buildWledSegments() {
+      if (document.getElementById('wled_seg_0_num')) harvestWledSegments();   // keep typed values
+      const n = Math.min(Math.max(parseInt(document.getElementById('wled_num_segments').value) || 1, 1), 4);
+      let html = '';
+      for (let i = 0; i < n; i++) {
+        const s = wledSegs[i] || { num_pixels: 0, first_pos: 0, last_pos: 100, mid_pixel: 0, mid_pos: 50 };
+        html += `
+          <div style="border:1px solid #334155; border-radius:8px; padding:10px; margin-top:8px;">
+            <h4 style="margin:0 0 6px 0;">Segment ${i + 1}</h4>
+            <label>Number of Pixels</label>
+            <input type="number" id="wled_seg_${i}_num" value="${s.num_pixels ?? 0}" min="2" step="1">
+            <label>First Pixel Line Position (line units)</label>
+            <input type="number" id="wled_seg_${i}_first" value="${s.first_pos ?? 0}" step="0.1">
+            <label>Last Pixel Line Position (line units)</label>
+            <input type="number" id="wled_seg_${i}_last" value="${s.last_pos ?? 100}" step="0.1">
+            <label>Mid Pixel Number (required)</label>
+            <input type="number" id="wled_seg_${i}_midpx" value="${s.mid_pixel ?? 0}" min="1" step="1">
+            <label>Mid Pixel Line Position (roughly mid-span)</label>
+            <input type="number" id="wled_seg_${i}_midpos" value="${s.mid_pos ?? 50}" step="0.1">
+          </div>`;
+      }
+      document.getElementById('wledSegments').innerHTML = html;
+    }
+    async function testWled() {
+      const el = document.getElementById('wledStatus');
+      if (el) { el.textContent = 'Sending test frame...'; el.style.color = '#38bdf8'; }
+      try {
+        const d = await (await fetch('/api/wled/test')).json();
+        if (el) {
+          el.textContent = d.sent
+            ? `SENT to ${d.ip}:${d.port} (${d.ms} ms) - check the strip`
+            : `FAILED: ${d.error || 'not sent'}`;
+          el.style.color = d.sent ? '#22c55e' : '#ef4444';
+        }
+      } catch (e) { if (el) { el.textContent = 'TEST ERROR'; el.style.color = '#ef4444'; } }
+    }
+
     async function loadConfig() {
       const res = await fetch('/api/config');
       const cfg = await res.json();
@@ -2003,6 +2660,21 @@ SETUP_HTML = """
       document.getElementById('track_agility').value = cfg.track_agility ?? 0.5;
       document.getElementById('out1_trigger').value = cfg.outputs["1"].trigger;
       document.getElementById('out1_duration').value = cfg.outputs["1"].duration;
+
+      // WLED (defaults injected from DEFAULT_CONFIG, so nothing is hardcoded on this page)
+      const wl = Object.assign({}, WLED_DEFAULTS, cfg.wled || {});
+      document.getElementById('wled_enabled').checked = !!wl.enabled;
+      document.getElementById('wled_ip').value = wl.ip || '';
+      document.getElementById('wled_scene').value = wl.scene || 'follower';
+      document.getElementById('wled_off_color').value = rgbToHex(wl.off_color);
+      document.getElementById('wled_on_color').value = rgbToHex(wl.on_color);
+      document.getElementById('wled_off_brightness').value = wl.off_brightness;
+      document.getElementById('wled_on_brightness').value = wl.on_brightness;
+      document.getElementById('wled_refresh_hz').value = wl.refresh_hz;
+      wledSegs = Array.isArray(wl.segments) ? wl.segments.map(s => Object.assign({}, s)) : [];
+      document.getElementById('wled_num_segments').value =
+        String(Math.min(Math.max(wledSegs.length || 1, 1), 4));
+      buildWledSegments();
 
       let html = '';
       for (let i = 2; i <= 8; i++) {
@@ -2083,6 +2755,28 @@ SETUP_HTML = """
         cfg.output_names[`out_${i}`] = document.getElementById(`out_${i}_name`).value.trim() || `Output ${i}`;
       }
 
+      // WLED (optional) -- must round-trip, since /api/config replaces the whole config.
+      cfg.wled = cfg.wled || {};
+      cfg.wled.enabled = document.getElementById('wled_enabled').checked;
+      cfg.wled.ip = document.getElementById('wled_ip').value.trim();
+      cfg.wled.scene = document.getElementById('wled_scene').value;
+      cfg.wled.off_color = hexToRgb(document.getElementById('wled_off_color').value);
+      cfg.wled.on_color = hexToRgb(document.getElementById('wled_on_color').value);
+      cfg.wled.off_brightness = parseFloat(document.getElementById('wled_off_brightness').value) || 0;
+      cfg.wled.on_brightness = parseFloat(document.getElementById('wled_on_brightness').value) || 0;
+      cfg.wled.refresh_hz = parseFloat(document.getElementById('wled_refresh_hz').value) || 30;
+      const nseg = Math.min(Math.max(parseInt(document.getElementById('wled_num_segments').value) || 1, 1), 4);
+      cfg.wled.segments = [];
+      for (let i = 0; i < nseg; i++) {
+        cfg.wled.segments.push({
+          num_pixels: parseInt(document.getElementById(`wled_seg_${i}_num`).value) || 0,
+          first_pos: parseFloat(document.getElementById(`wled_seg_${i}_first`).value) || 0,
+          last_pos: parseFloat(document.getElementById(`wled_seg_${i}_last`).value) || 0,
+          mid_pixel: parseInt(document.getElementById(`wled_seg_${i}_midpx`).value) || 0,
+          mid_pos: parseFloat(document.getElementById(`wled_seg_${i}_midpos`).value) || 0
+        });
+      }
+
       await fetch('/api/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2106,4 +2800,5 @@ async def execute_route():
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_route():
-    return SETUP_HTML
+    # Inject the WLED defaults so the form's fallbacks always match DEFAULT_CONFIG["wled"].
+    return SETUP_HTML.replace("__WLED_DEFAULTS__", _WLED_JS_DEFAULTS)

@@ -6,6 +6,8 @@ people move through, and it trips relays as they hit your marks. Two pieces:
 1. **ESP32 firmware** — a tiny control app, an API, and UDP discovery. This is what actually drives the relays.
 2. **Docker backend** — Intel-optimized YOLO26m (OpenVINO) doing the detection, plus the tracking logic and web UI that decide when to poke the ESP32.
 
+Optional: up to 4 WLED segments with positional effects.
+
 This is a personal project. I got tired of re-teaching myself my old self-built manual rig
 every October — a dozen timers, pull-ups, beam sensors, and a rat's nest of wiring.
 Tested on a Meteor Lake 155H (NPU + iGPU), holds ~20 FPS.
@@ -22,6 +24,7 @@ Tested on a Meteor Lake 155H (NPU + iGPU), holds ~20 FPS.
 - **Name your buttons.** Rename Outputs 2-8 on `/setup` and they show up on `/execute`. Main always reads "Main".
 - **Docker + `/data` volume.** Config and model live in `./data`, so the container stays disposable.
 - **Sane controller link.** One serialized TCP connection at a time (basic ESP32s wedge on concurrent clients), bounded timeouts, retries, an idle PING keep-alive, and a non-blocking command queue so a slow board can't stall inference.
+- **WLED lighting (optional).** Drive an addressable LED run as a *live* position line over **DDP** (UDP 4048). While Main is OFF the run holds one color/brightness; while Main is ON it renders a scene — **solid**, or the **follower** ("dimming") effect, where the pixels over each person go dark and step back up (zero, then 0.15×, 0.20×, 0.30×, 0.60×, then full) either side, overlaps keeping the darker value. The ramp is deliberately low and non-linear because perceived brightness isn't linear. Up to 4 pixel runs, each calibrated with a 3-point **quadratic** (evenly-spaced assumptions won't cut it — the app's 0-100 axis doesn't scale linearly with distance). Streamed off the inference path on its own timer.
 
 ## Limitations
 
@@ -29,6 +32,7 @@ Tested on a Meteor Lake 155H (NPU + iGPU), holds ~20 FPS.
 - **One camera, one line, one config.** Single RTSP stream, single base line, one global config. No multi-camera or multi-zone setups.
 - **People only.** The detector is tuned for the person class; cars, pets, and decorations don't count.
 - **Fixed hardware shape.** 8 channels tied to a single ESP32 — not expandable without code changes.
+- **The WLED run needs calibrating by hand.** One strip per config, and it only lines up after you punch in each run's pixel count and a few pixel positions — the app's position number doesn't scale linearly to physical distance, so a straight 0-100 guess will be off at the ends.
 - **10 tracked people max.** Extras get dropped.
 - **The UI is a mirror, not the truth.** It shows the backend's Kalman output and the *intended* output state. There's no GPIO read-back, so a button can briefly show something the pin isn't doing.
 - **No auth.** Trusted-LAN only — don't expose port 8777 to the internet.
@@ -50,6 +54,7 @@ Then open **http://docker-host:8777** (that's the web UI) and:
 2. **Start the engine** from `/execute` (or tick *Auto-start engine on boot* on `/setup`). Nothing fires automatically until it's running — the manual output buttons work regardless.
 3. **Flash the ESP32** — paste `esp32/firmware.cpp` into the Arduino IDE (ESP32 core), set your WiFi SSID/password, and flash. It serves its own control page on port 80 and talks to the backend on TCP 5000 (UDP discovery on 5001). Pin map is in [ESP32 wiring](#esp32-wiring) below.
 4. **Model** — nothing to do. The backend loads the IR from `/data/models/yolo26m`; if it's missing it downloads `yolo26m.pt` once, builds the 640×640 FP16 IR into `/data/models/yolo26m`, then discards the weights (only the `.xml`/`.bin` persist). Set `HALO_WEIGHTS` to build from a local `.pt` instead (offline).
+5. **WLED (optional)** — on the WLED device enable *Receive Realtime State* / Network DDP, set transitions to **0 ms**, *Realtime Timeout* to 2-3 s, and *Force Max Brightness in Realtime*. On `/setup` tick **Enable WLED output**, enter the IP, and set up to 4 segments (pixel count + the line position of the first/last pixel + one mid pixel) — hit **Set First/Last from line span** first so the ends line up. Device-side checklist lives in `test/wled-setting.md`.
 
 Hardware is cheap and easy if you already have an Intel inference box: 1x ESP32, 1x darlington array,
 and 1-2x 8-channel relay boards (one darlington collector can drive several relays). That
@@ -77,7 +82,8 @@ coils — so you can fan a single channel out to multiple relays.
 ## Knobs
 
 Everything's on `/setup`, saves to `./data/config.yml`, and most of it applies **live** (no
-restart). Three groups: what the detector believes, how the dot moves, and what fires.
+restart). Four groups: what the detector believes, how the dot moves, what fires, and the
+optional WLED strip.
 
 **Camera & system**
 - **Device priority** — accelerator order (CPU is always the fallback). Changing it recompiles the model.
@@ -100,10 +106,17 @@ restart). Three groups: what the detector believes, how the dot moves, and what 
 - **Threshold point** + **threshold delay** — where the reverse logic arms, and how long after the cross it waits.
 - **Outputs 1–8** — enable/disable (2–8), trigger point, duration, depends-on-Main, max activations, reverse; plus **button names** for 2–8 (Main always reads "Main"). A disabled channel never fires and its button is hidden on `/execute`.
 
+**WLED lighting (optional)** — its own card on `/setup`. Ships **enabled** but inert until you give it an IP, so nothing is ever sent to a strip you haven't named.
+- **Enable WLED output** + **WLED IP** (manual; no discovery). **Test** sends one real DDP frame so you can confirm it lands.
+- **While Main is OFF** — color + brightness (default deep orange-red `#CC3300` @ 50%).
+- **While Main is ON** — **Scene** (`follower` = dark holes track people, or `solid`; default follower), color (default deep red `#800000`; a scene may ignore it), brightness (default 50%), and **Refresh Rate** (Hz — default 15; keeps WLED in realtime and sets how fast the holes move).
+- **Segments** (up to 4) — each is a run of pixels along the line: **pixel count**, the line position of its **first** and **last** pixel, and one **mid** pixel (number + position, roughly mid-span). Those 3 points calibrate a quadratic pixel↔position map, so uneven spacing is handled. Pixel 0 is the run's first DDP pixel; physical direction is WLED's own segment "reverse" checkbox, not the app's.
+- **Line span isn't 0-100.** A position is a perpendicular projection onto your base line, so wherever the inclusion zone runs past the line's ends it reads negative or past 100. `/setup` shows the real span for whatever you've drawn, and **Set First/Last from line span** drops those numbers into the segments — use them, or the holes drift at the ends.
+
 ## Roadmap
 
 (maybe this year, maybe next)
 
-1. WLED integration.
+1. More WLED position effects.
 2. Additional webhook outputs.
 3. Additional or backup sensor inputs.
