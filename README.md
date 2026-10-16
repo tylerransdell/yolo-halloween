@@ -54,7 +54,7 @@ Then open **http://docker-host:8777** (that's the web UI) and:
 2. **Start the engine** from `/execute` (or tick *Auto-start engine on boot* on `/setup`). Nothing fires automatically until it's running — the manual output buttons work regardless.
 3. **Flash the ESP32** — paste `esp32/firmware.cpp` into the Arduino IDE (ESP32 core), set your WiFi SSID/password, and flash. It serves its own control page on port 80 and talks to the backend on TCP 5000 (UDP discovery on 5001). Pin map is in [ESP32 wiring](#esp32-wiring) below.
 4. **Model** — nothing to do. The backend loads the IR from `/data/models/yolo26m`; if it's missing it downloads `yolo26m.pt` once, builds the 640×640 FP16 IR into `/data/models/yolo26m`, then discards the weights (only the `.xml`/`.bin` persist). Set `HALO_WEIGHTS` to build from a local `.pt` instead (offline).
-5. **WLED (optional)** — on the WLED device enable *Receive Realtime State* / Network DDP, set transitions to **0 ms**, *Realtime Timeout* to 2-3 s, and *Force Max Brightness in Realtime*. On `/setup` tick **Enable WLED output**, enter the IP, and set up to 4 segments (pixel count + the line position of the first/last pixel + one mid pixel) — hit **Set First/Last from line span** first so the ends line up. Device-side checklist lives in `test/wled-setting.md`.
+5. **WLED (optional)** — on the WLED device enable *Receive Realtime State* / Network DDP, set transitions to **0 ms**, *Realtime Timeout* to 2-3 s, and *Force Max Brightness in Realtime*. On `/setup` tick **Enable WLED output**, enter the IP, and set up to 4 segments (pixel count + the line position of the first/last pixel + one mid pixel) — hit **Set First/Last from line span** first so the ends line up. Device-side checklist is in [WLED setup](#wled-setup) below.
 
 Hardware is cheap and easy if you already have an Intel inference box: 1x ESP32, 1x darlington array,
 and 1-2x 8-channel relay boards (one darlington collector can drive several relays). That
@@ -78,6 +78,20 @@ more smoke), and active/idle scene switching on AC or DC.
 
 Each output feeds a darlington input, and one darlington collector can drive several relay
 coils — so you can fan a single channel out to multiple relays.
+
+## WLED setup
+
+The app drives the strip with raw RGB over **DDP (UDP 4048)**, so WLED needs a few boxes ticked:
+
+- **Kill the smoothing.** *Settings → LED Preferences* → set **transition time (fade) to 0 ms**, and
+  uncheck palette transitions. Otherwise WLED eases every change and the holes lag behind anyone
+  moving quickly.
+- **Accept realtime data.** *Settings → Sync Interfaces* → tick **Receive Realtime State**, leave
+  **Network DDP** enabled (UDP 4048), set **Realtime Timeout to 2-3 s**, and tick **Force Max
+  Brightness in Realtime** — skip that last one and WLED dims the values we send right back down.
+- **Match the pixel counts.** The segments set up in WLED should add up to the same pixels you
+  configured per run on `/setup`, and DDP pixel 0 is the first LED on the data pin. A run wired
+  backwards? Tick that segment's **Reverse direction** in WLED — the app never worries about direction.
 
 ## Knobs
 
