@@ -1,4 +1,4 @@
-# YOLO-haloween
+# YOLO-halloween
 
 A working-prototype Halloween trigger engine. Point a camera at your walkway, it watches
 people move through, and it trips relays as they hit your marks. Two pieces:
@@ -39,7 +39,7 @@ Tested on a Meteor Lake 155H (NPU + iGPU), holds ~20 FPS.
 - **Bad WiFi = a laggy dot.** The dot is exactly the backend's Kalman output with zero client-side smoothing, so a weak link makes it stutter, freeze, and jump. The polling fallback only kicks in if the browser can't do EventSource at all.
 - **Calibration is snapshot-based.** You draw geometry on a still frame, not live — move the camera and you re-draw.
 - **Some assembly required.** x86 Linux + Docker; the Intel NPU/GPU runtimes get pulled at image build time, and the YOLO weights are downloaded once on first start (needs internet that once — set `HALO_WEIGHTS` to build offline).
-- **It can be fooled.** YOLO26m is excellent and worth the AGPL3 license but haloween scenes can be chaotic, so filter with caution.
+- **It can be fooled.** YOLO26m is excellent and worth the AGPL3 license but halloween scenes can be chaotic, so filter with caution.
 - **Latency exists.** Tuned for low end-to-end delay, but camera + inference + network still add up. This is a best effort application with plenty of knobs to dial in the speed you want.
 
 ## Quick start
