@@ -164,7 +164,9 @@ DEFAULT_CONFIG = {
         # are (pixel_number, line_position): first pixel, a mid pixel, and the last pixel ->
         # quadratic fit pos = f(pixel), inverted per person. No direction handling here --
         # WLED's own segment "reverse" checkbox owns physical orientation. The line positions
-        # are NOT limited to 0-100: /setup shows the real span for your geometry.
+        # are NOT limited to 0-100: /setup shows the outer bounds for your geometry -- that is the
+        # DETECTION range (where people can read), not the pixel range. A run's first/last pixel
+        # positions are wherever those pixels physically sit, usually a narrower range inside it.
         "segments": [
             {"num_pixels": 214, "first_pos": 0.0, "last_pos": 100.0, "mid_pixel": 101, "mid_pos": 50.0},
         ],
@@ -1363,20 +1365,21 @@ def _kalman_noise_from_config():
     drives the velocity process noise Q: higher lets the estimated speed change quickly, so
     the reported position stays locked to sudden / fast movement.
     """
-    s = config.get("position_smoothing", 0.25)
+    # These fallbacks must mirror DEFAULT_CONFIG["position_smoothing"] / ["track_agility"].
+    s = config.get("position_smoothing", 0.10)
     if isinstance(s, bool):          # backward-compat with the old True/False setting
-        s = 0.25 if s else 0.0
+        s = 0.10 if s else 0.0
     try:
         s = min(max(float(s), 0.0), 1.0)
     except (TypeError, ValueError):
-        s = 0.25
-    a = config.get("track_agility", 0.5)
+        s = 0.10
+    a = config.get("track_agility", 0.6)
     try:
         a = min(max(float(a), 0.0), 1.0)
     except (TypeError, ValueError):
-        a = 0.5
-    r = 0.5 + (s * s) * 50.0           # 0 -> R=0.5 (raw) | 0.25 -> ~3.6 (old default) | 1 -> ~50
-    q_vel = 500.0 + (a * a) * 30000.0  # 0.5 -> 8000 (old default)
+        a = 0.6
+    r = 0.5 + (s * s) * 50.0           # 0 -> R=0.5 (raw) | 0.10 -> ~1.0 (default) | 1 -> ~50
+    q_vel = 500.0 + (a * a) * 30000.0  # 0.6 -> ~11300 (default)
     return 1.0, q_vel, r
 
 # --- Constant-velocity Kalman track (state: cx, cy, w, h, vcx, vcy, vw, vh) ---
@@ -2287,15 +2290,15 @@ SETUP_HTML = """
           (feeding the display, triggers and baseline projection). It does <b>not</b> affect what the detector
           sees. These two knobs trade latency against steadiness &mdash; no restart needed.</div>
         <label>Position Smoothing &mdash; 0 to 1</label>
-        <input type="number" id="position_smoothing" step="0.05" min="0" max="1" placeholder="0.25">
+        <input type="number" id="position_smoothing" step="0.05" min="0" max="1" placeholder="0.10">
         <div class="hint"><b>0 = near-real-time</b> (lowest latency, raw-ish &mdash; some jitter). <b>1 = heavy</b>
-          smoothing (steady dot, slightly laggy). Suggested 0&ndash;0.4 for a jump scare; default 0.25.</div>
+          smoothing (steady dot, slightly laggy). Suggested 0&ndash;0.4 for a jump scare; default 0.10.</div>
         <label>Track Agility &mdash; 0 to 1</label>
-        <input type="number" id="track_agility" step="0.05" min="0" max="1" placeholder="0.50">
+        <input type="number" id="track_agility" step="0.05" min="0" max="1" placeholder="0.60">
         <div class="hint">How quickly the filter follows <b>sudden changes in speed</b>. Higher = the reported
           position stays locked to fast/lunging movement; lower = steadier but slower to react. Suggested
-          0.3&ndash;0.8; default 0.50.</div>
-        <div class="hint" style="color:#7c8899;">Real-time start: <b>0.25 / 0.50</b>. Want it snappier &rarr; lower
+          0.3&ndash;0.8; default 0.60.</div>
+        <div class="hint" style="color:#7c8899;">Real-time start: <b>0.10 / 0.60</b>. Want it snappier &rarr; lower
           Position Smoothing. Dot lags a runner &rarr; raise Track Agility. Dot jitters when still &rarr; raise Smoothing.</div>
       </div>
     </div>
@@ -2379,15 +2382,16 @@ SETUP_HTML = """
         <h4 style="margin:0 0 6px 0;">Segments (pixel runs along the line)</h4>
         <div class="hint">Up to 4. For each run enter its pixel count, the line position of its
           <b>first pixel</b>, of its <b>last pixel</b>, and one <b>mid pixel</b> (number + position,
-          roughly mid-span). Those 3 points calibrate a quadratic pixel&harr;position map, so uneven
+          roughly midway along the run). Those 3 points calibrate a quadratic pixel&harr;position map, so uneven
           spacing is handled &mdash; it is <b>not</b> a linear fit.</div>
         <div id="wledBounds" style="font-family:monospace; font-size:12px; color:#38bdf8; margin:2px 0 4px 0;"></div>
-        <div class="hint" style="margin-top:0;">That <b>line span</b> is the real range your base
-          line reports &mdash; it runs past 0/100 wherever the inclusion zone extends beyond the
-          line's ends, so positions are <b>not</b> fixed to 0-100. Use those two numbers for a
-          run's first/last pixel positions. If a run is wired the other way round, swap the two
-          (or let WLED's segment "reverse" handle it).</div>
-        <button type="button" class="tool" onclick="fillBoundsIntoSegments()">Set First/Last from line span</button>
+        <div class="hint" style="margin-top:0;">That <b>line span</b> is only the <b>outer boundary</b>
+          of what your base line can report &mdash; it runs past 0/100 wherever the inclusion zone
+          extends beyond the line's ends, and a person can never read outside it. It is <b>not</b>
+          a pixel range and the ends are not your first/last pixels: those two are wherever those
+          pixels physically sit on the line, which is usually a <b>narrower</b> range than the span
+          (e.g. a span of -11.7..103.5 with a run that only covers 0..100). If a run is wired the
+          other way round, swap them (or let WLED's segment "reverse" handle it).</div>
         <label>Number of Segments</label>
         <select id="wled_num_segments" onchange="buildWledSegments()">
           <option value="1">1</option>
@@ -2569,7 +2573,8 @@ SETUP_HTML = """
       }
       const gated = Array.isArray(geo.inclusion) && geo.inclusion.length >= 3;
       el.textContent = `Line span: ${round1(b[0]).toFixed(1)}  ...  ${round1(b[1]).toFixed(1)}`
-        + (gated ? '   (from the inclusion zone)' : '   (whole frame - draw the inclusion zone for the real span)');
+        + (gated ? '   (outer bounds of the detection range)'
+                 : '   (whole frame - draw the inclusion zone for the real bounds)');
       el.style.color = gated ? '#38bdf8' : '#eab308';
     }
     function harvestWledSegments() {
@@ -2585,18 +2590,6 @@ SETUP_HTML = """
           mid_pos: parseFloat(document.getElementById(`wled_seg_${i}_midpos`).value) || 0
         });
       }
-    }
-    function fillBoundsIntoSegments() {
-      const b = lineBounds();
-      if (!b) { alert('Draw the base line first (and the inclusion zone) so the line span is known.'); return; }
-      const n = Math.min(Math.max(parseInt(document.getElementById('wled_num_segments').value) || 1, 1), 4);
-      for (let i = 0; i < n; i++) {
-        const f = document.getElementById(`wled_seg_${i}_first`);
-        const l = document.getElementById(`wled_seg_${i}_last`);
-        if (f) f.value = round1(b[0]);
-        if (l) l.value = round1(b[1]);
-      }
-      harvestWledSegments();
     }
     // ---- end WLED line-span bounds ----
     function buildWledSegments() {
@@ -2616,7 +2609,7 @@ SETUP_HTML = """
             <input type="number" id="wled_seg_${i}_last" value="${s.last_pos ?? 100}" step="0.1">
             <label>Mid Pixel Number (required)</label>
             <input type="number" id="wled_seg_${i}_midpx" value="${s.mid_pixel ?? 0}" min="1" step="1">
-            <label>Mid Pixel Line Position (roughly mid-span)</label>
+            <label>Mid Pixel Line Position (roughly midway along the run)</label>
             <input type="number" id="wled_seg_${i}_midpos" value="${s.mid_pos ?? 50}" step="0.1">
           </div>`;
       }
@@ -2656,8 +2649,8 @@ SETUP_HTML = """
       document.getElementById('track_validity_ms').value = cfg.track_validity_ms ?? 200;
       const ps = cfg.position_smoothing;
       document.getElementById('position_smoothing').value =
-        (typeof ps === 'number') ? ps : (ps === false ? 0 : 0.25);   // migrate old true/false
-      document.getElementById('track_agility').value = cfg.track_agility ?? 0.5;
+        (typeof ps === 'number') ? ps : (ps === false ? 0 : 0.10);   // migrate old true/false
+      document.getElementById('track_agility').value = cfg.track_agility ?? 0.6;
       document.getElementById('out1_trigger').value = cfg.outputs["1"].trigger;
       document.getElementById('out1_duration').value = cfg.outputs["1"].duration;
 
@@ -2732,9 +2725,9 @@ SETUP_HTML = """
       const vms = parseFloat(document.getElementById('track_validity_ms').value);
       cfg.track_validity_ms = isNaN(vms) ? 200 : vms;
       const ps = parseFloat(document.getElementById('position_smoothing').value);
-      cfg.position_smoothing = isNaN(ps) ? 0.25 : Math.min(Math.max(ps, 0), 1);   // 0 is valid (raw)
+      cfg.position_smoothing = isNaN(ps) ? 0.10 : Math.min(Math.max(ps, 0), 1);   // 0 is valid (raw)
       const ag = parseFloat(document.getElementById('track_agility').value);
-      cfg.track_agility = isNaN(ag) ? 0.5 : Math.min(Math.max(ag, 0), 1);
+      cfg.track_agility = isNaN(ag) ? 0.6 : Math.min(Math.max(ag, 0), 1);
       cfg.inclusion_polygon = geo.inclusion;
       cfg.exclusion_polygons = geo.exclusions;
       cfg.base_line = { p1: geo.line.p1, p2: geo.line.p2 };
