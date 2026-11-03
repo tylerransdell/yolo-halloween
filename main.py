@@ -147,8 +147,9 @@ DEFAULT_CONFIG = {
         "8": {"trigger": 20.0, "duration": 0.5, "depends": True, "max_act": 1, "reverse": True, "enabled": True},
     },
     # WLED (optional): drive an addressable LED run as a live "position line" over DDP.
-    # OFF = one static color/brightness; ON = a scene ("follower" = dark holes that track
-    # people, or "solid"). Ships ENABLED but inert until "ip" is set (no IP -> nothing sent).
+    # OFF = one static color/brightness; ON = a scene ("follower" / "follower_narrow" = dark
+    # holes that track people, or "solid"). Ships ENABLED but inert until "ip" is set (no IP ->
+    # nothing sent).
     # These are the tuned values; only the IP is site-specific. See the WLED section below.
     "wled": {
         "enabled": True,
@@ -159,7 +160,9 @@ DEFAULT_CONFIG = {
         "off_brightness": 50,        # percent (0-100)
         "on_color": [128, 0, 0],     # deep red (#800000) while Main is ON
         "on_brightness": 50,         # percent (0-100)
-        "scene": "follower",         # "follower" (dark holes) | "solid"
+        # "follower" (5-px hole + 2-px rings, ~60 px/m runs) | "follower_narrow" (1-px hole +
+        # 1-px rings, ~15 px/m runs) | "solid". Unknown values fall back to "follower".
+        "scene": "follower",
         # Up to 4 segments: each is a run of pixels along the line. The 3 calibration points
         # are (pixel_number, line_position): first pixel, a mid pixel, and the last pixel ->
         # quadratic fit pos = f(pixel), inverted per person. No direction handling here --
@@ -616,20 +619,64 @@ async def send_esp32_command(channel: int, op_state: int, connect_timeout: float
 # non-uniform physical spacing is handled (deliberately NOT a linear mapping: 30 app units near
 # one end can be 30 ft while 30 units near the other can be 50 ft). While Main is OFF the run
 # shows one static color/brightness; while Main is ON it renders the selected scene
-# ("follower" = dark holes that track people, or "solid"). Purely additive; off by default.
+# ("follower"/"follower_narrow" = dark holes that track people, or "solid"). Purely additive.
 WLED_DDP_PORT = 4048
 WLED_MAX_DATALEN = 1440        # DDP max data bytes/packet (480 RGB pixels -> fits an ethernet MTU)
 WLED_ID_DISPLAY = 1            # DDP_ID_DISPLAY
 WLED_MAX_SEGMENTS = 4
-# Follower band geometry, in PIXELS from a person's centre pixel (fixed). Levels are fractions of
-# the user's ON brightness -- deliberately low and non-linear, because perceived brightness is not
-# linear in value: a 25/50/75 ramp reads as barely dimmed, while these read as a real falloff.
-#   dist <= 2 -> dark (0%), then each 2-pixel ring: 15%, 20%, 30%, 60% -> full beyond 10 px.
+# Scene names (the ``wled.scene`` config value). An unknown name falls back to "follower".
+WLED_SCENE_FOLLOWER = "follower"
+WLED_SCENE_FOLLOWER_NARROW = "follower_narrow"
+WLED_SCENE_SOLID = "solid"
+WLED_SCENES = (WLED_SCENE_FOLLOWER, WLED_SCENE_FOLLOWER_NARROW, WLED_SCENE_SOLID)
+# Follower band geometry, in PIXELS from a person's centre pixel (fixed, not UI-editable). Levels
+# are fractions of the user's ON brightness -- deliberately low and non-linear, because perceived
+# brightness is not linear in value: a 25/50/75 ramp reads as barely dimmed, while these read as a
+# real falloff.
+# Both followers use the SAME levels; they differ in how wide the hole and its rings are, so each
+# suits how many pixels the run has per metre:
+#   follower        (dense runs, ~60 px/m): 5-pixel hole + 2-pixel rings -> 21-px footprint (+-10)
+#       dist <= 2 -> 0%, then (2,4] 15%, (4,6] 20%, (6,8] 30%, (8,10] 60%, beyond -> full
+#   follower_narrow (sparse runs, ~15 px/m): 1-PIXEL hole + 1-pixel rings -> 9-px footprint (+-4)
+#       nearest px -> 0%, then (0,1] 15%, (1,2] 20%, (2,3] 30%, (3,4] 60%, beyond -> full
+# "dark_pixels" is the RADIUS of the solid hole, so 2 -> 5 pixels wide. 0 asks for a ONE-pixel
+# hole: a radius band would fall *between* pixels whenever a person's centre is fractional (nearly
+# always), so a 0 radius is rendered as "the single pixel nearest the person" instead -- see
+# wled_band(). That keeps the narrow hole exactly one pixel wide at every sub-pixel phase.
 WLED_DARK_PIXELS = 2
-WLED_BAND_STEP = 2
+WLED_NARROW_DARK_PIXELS = 0
 WLED_BAND_LEVELS = (0.0, 0.15, 0.20, 0.30, 0.60)
+WLED_BAND_STEP = 2             # follower ring width, in pixels
+WLED_NARROW_BAND_STEP = 1      # follower_narrow ring width, in pixels
+# Per-scene band geometry: {"dark_pixels": core radius, "band_step": ring width, "levels": ramp}.
+WLED_SCENE_GEOMETRY = {
+    WLED_SCENE_FOLLOWER: {"dark_pixels": WLED_DARK_PIXELS, "band_step": WLED_BAND_STEP,
+                          "levels": WLED_BAND_LEVELS},
+    WLED_SCENE_FOLLOWER_NARROW: {"dark_pixels": WLED_NARROW_DARK_PIXELS, "band_step": WLED_NARROW_BAND_STEP,
+                                 "levels": WLED_BAND_LEVELS},
+}
 WLED_BAND_EPS = 1e-6   # tolerance so an exact band edge isn't flipped by float noise
 _wled_sock = None
+
+
+def wled_scene(wled):
+    """Scene name to render for a ``wled`` block: a known name, else the "follower" default.
+
+    Keeps the config tolerant of old/hand-edited values and of a missing key (old configs), while
+    giving one place that knows every valid scene name.
+    """
+    name = str((wled or {}).get("scene") or WLED_SCENE_FOLLOWER).strip().lower()
+    return name if name in WLED_SCENES else WLED_SCENE_FOLLOWER
+
+
+def wled_band_geometry(scene):
+    """Band geometry (dark-core radius, ring width, levels) for a follower scene.
+
+    ``solid`` (and anything unknown) gets the default follower geometry; it is never used to
+    build a mask because ``wled_build_frame`` short-circuits ``solid``.
+    """
+    return WLED_SCENE_GEOMETRY.get(str(scene or "").strip().lower(),
+                                   WLED_SCENE_GEOMETRY[WLED_SCENE_FOLLOWER])
 
 
 def wled_cfg():
@@ -720,12 +767,44 @@ def wled_total_pixels(wled):
     return sum(f[3] for f in wled_segment_fits(wled))
 
 
-def wled_multipliers(positions, wled):
+def wled_band(dist, geometry, core_index=None):
+    """Multiplier for pixels ``dist`` (in PIXELS, may be fractional) from a person's centre pixel.
+
+    ``dist <= dark_pixels`` is the hole (level 0), then each ``band_step``-wide ring takes the next
+    level from the ramp, and everything past the last ring stays at 1.0 (untouched). Band edges are
+    compared against float distances, so a person's centre sitting between two pixels still moves
+    the whole hole smoothly.
+
+    A geometry with ``dark_pixels <= 0`` asks for a ONE-pixel hole. A radius band cannot express
+    that: a person's centre is almost never exactly on a pixel, so ``dist <= 0`` would match
+    nothing and the hole would disappear. The pixel nearest the person (``core_index``) is forced
+    dark instead, applied LAST so it always wins -- the hole stays exactly one pixel wide at every
+    sub-pixel phase, and its rings still slide smoothly around it.
+    """
+    levels = geometry["levels"]
+    dark = float(geometry["dark_pixels"])
+    step = float(geometry["band_step"])
+    band = np.ones(len(dist), dtype=np.float64)
+    if dark > 0.0:
+        band[dist <= dark + WLED_BAND_EPS] = levels[0]
+    for k, level in enumerate(levels[1:], start=1):
+        lo = dark + (k - 1) * step
+        band[(dist > lo + WLED_BAND_EPS) & (dist <= lo + step + WLED_BAND_EPS)] = level
+    if dark <= 0.0 and core_index is not None and 0 <= int(core_index) < len(band):
+        band[int(core_index)] = levels[0]
+    return band
+
+
+def wled_multipliers(positions, wled, geometry=None):
     """Per-pixel brightness multipliers (0..1) across every pixel of every segment.
 
     Each person darkens the pixels over them and opens a dimmer ring to either side; overlaps
     keep the DARKER value (np.minimum) so two nearby people never brighten each other's hole.
+    The ring geometry comes from the scene (``follower`` = 5-pixel hole + 2-pixel rings,
+    ``follower_narrow`` = 1-pixel hole + 1-pixel rings) unless one is passed in explicitly.
     """
+    if geometry is None:
+        geometry = wled_band_geometry(wled_scene(wled))
     fits = wled_segment_fits(wled)
     total = sum(f[3] for f in fits)
     out = np.ones(total, dtype=np.float64)
@@ -733,17 +812,16 @@ def wled_multipliers(positions, wled):
         return out
     offset = 0
     for fit in fits:
-        idx = np.arange(fit[3], dtype=np.float64)
+        n = fit[3]
+        idx = np.arange(n, dtype=np.float64)
         for pos in positions:
             centre = wled_position_to_pixel(pos, fit)
-            dist = np.abs(idx - centre)
-            band = np.ones(fit[3], dtype=np.float64)
-            band[dist <= WLED_DARK_PIXELS + WLED_BAND_EPS] = WLED_BAND_LEVELS[0]
-            for k, level in enumerate(WLED_BAND_LEVELS[1:], start=1):
-                lo = WLED_DARK_PIXELS + (k - 1) * WLED_BAND_STEP
-                band[(dist > lo + WLED_BAND_EPS) & (dist <= lo + WLED_BAND_STEP + WLED_BAND_EPS)] = level
-            out[offset:offset + fit[3]] = np.minimum(out[offset:offset + fit[3]], band)
-        offset += fit[3]
+            # Nearest pixel to the (fractional) centre, half-up: the one-pixel hole for geometries
+            # with a 0 radius. Also used by every other geometry, which ignores it.
+            core = int(min(max(np.floor(centre + 0.5), 0.0), float(n - 1)))
+            band = wled_band(np.abs(idx - centre), geometry, core)
+            out[offset:offset + n] = np.minimum(out[offset:offset + n], band)
+        offset += n
     return out
 
 
@@ -775,8 +853,9 @@ def wled_build_frame(wled, positions=None, main_active=False):
     """RGB byte buffer (3 bytes/pixel, all segments concatenated) for one DDP frame.
 
     Main OFF -> every pixel = off_color at off_brightness (static).
-    Main ON  -> the selected scene at on_color/on_brightness: "solid" is uniform, "follower"
-                dims each pixel by its track-hole multiplier.
+    Main ON  -> the selected scene at on_color/on_brightness: "solid" is uniform, while "follower"
+                and "follower_narrow" dim each pixel by their track-hole multiplier (the two differ
+                only in ring width -- see WLED_SCENE_GEOMETRY).
     """
     total = wled_total_pixels(wled)
     if total <= 0:
@@ -789,12 +868,12 @@ def wled_build_frame(wled, positions=None, main_active=False):
 
     r, g, b = _rgb255(wled.get("on_color"))
     s = _pct_to_scale(wled.get("on_brightness"))
-    scene = str(wled.get("scene") or "follower").lower()
-    if scene == "solid":
+    scene = wled_scene(wled)
+    if scene == WLED_SCENE_SOLID:
         # A scene may ignore the color picker entirely; this one honors it.
         return bytes([int(r * s), int(g * s), int(b * s)]) * total
 
-    mult = wled_multipliers(positions or [], wled)
+    mult = wled_multipliers(positions or [], wled, wled_band_geometry(scene))
     frame = bytearray(total * 3)
     for i in range(total):
         m = s * float(mult[i]) if i < len(mult) else s
@@ -932,7 +1011,8 @@ def _normalize_wled(w):
         out["refresh_hz"] = min(max(float(w.get("refresh_hz", 30)), 1.0), 120.0)
     except (TypeError, ValueError):
         out["refresh_hz"] = 30.0
-    out["scene"] = "solid" if str(w.get("scene") or "").lower() == "solid" else "follower"
+    # Whitelist the scene: an unknown/hand-edited name must not silently reach the renderer.
+    out["scene"] = wled_scene(w)
     defaults = DEFAULT_CONFIG["wled"]
     out["off_color"] = list(_rgb255(w.get("off_color") or defaults["off_color"]))
     out["on_color"] = list(_rgb255(w.get("on_color") or defaults["on_color"]))
@@ -2171,10 +2251,14 @@ EXECUTE_HTML = """
                 st.textContent = 'enabled, but no IP set - add it on /setup';
               } else {
                 const people = (data.detected_persons || []).length;
-                const holes = (on && wl.scene === 'follower')
+                // Both follower scenes track one hole per person; only solid has none.
+                const sceneName = String(wl.scene || '');
+                const holes = (on && sceneName.indexOf('follower') === 0)
                   ? `/${people} hole${people === 1 ? '' : 's'}` : '';
+                const sceneLabel = sceneName === 'follower_narrow'
+                  ? 'follower narrow' : (sceneName || '-');
                 st.textContent = `${wl.ip}:${wl.port} | ${(wl.fps || 0).toFixed(0)} fps | ${wl.frames_sent || 0} frames`
-                  + ` | ${wl.scene || '-'}${holes} | sending ${rgbHex(col)} @${pct}%`
+                  + ` | ${sceneLabel}${holes} | sending ${rgbHex(col)} @${pct}%`
                   + (wl.last_error ? ` | ERR ${wl.last_error}` : '');
               }
             }
@@ -2367,9 +2451,15 @@ SETUP_HTML = """
         <h4 style="margin:0 0 6px 0;">While Main is ON</h4>
         <label>Scene</label>
         <select id="wled_scene">
-          <option value="follower">Follower &mdash; dark holes track people</option>
+          <option value="follower">Follower &mdash; 5-pixel holes, 2-pixel steps (dense runs)</option>
+          <option value="follower_narrow">Follower narrow &mdash; 1-pixel holes, 1-pixel steps (sparse runs)</option>
           <option value="solid">Solid &mdash; one uniform color</option>
         </select>
+        <div class="hint" style="margin-top:6px;"><b>Follower</b> punches a <b>5-pixel</b> dark hole
+          with <b>2-pixel</b> falloff steps (21 pixels total); <b>Follower narrow</b> punches a
+          <b>1-pixel</b> hole with <b>1-pixel</b> steps (9 pixels total). Pick by pixel density:
+          ~60 pixels/m use Follower, ~15 pixels/m use Follower narrow &mdash; on a sparse run the
+          wide hole and rings cover most of the strip.</div>
         <label>Color <span style="color:#64748b;">(a scene may ignore this)</span></label>
         <input type="color" id="wled_on_color" style="height:38px; padding:2px;">
         <label>Brightness (%)</label>
