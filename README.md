@@ -69,7 +69,9 @@ Too easy for a schematic, endless possibilities with NC + NO dry contacts. The b
 
 Each ESP32 output goes to a darlington base (ULN2803A); the collectors drive active-low relay boards, so a HIGH GPIO activates the relay. Boards can be 5 V or 12 V as long as you supply that voltage — I use 12 V because the same enclosure feeds 6 V to Spirit animatronics that are finicky about 5 V inputs.
 
-**Use a commercial camera** — Dahua, Axis, Uniview, Hikvision, Hanwha, etc. The point isn't the sensor, it's the control: you can lock exposure, gain and day/night switching so the picture stays consistent as the light changes, and it will serve a **640-horizontal-pixel sub stream** for the detector instead of making you decode a 4K main stream. At 640 wide the letterbox only pads (no rescale), so inference runs on exactly what the camera sends. That's the knob the preview video is missing — illumination not locked down hard enough, gain too high.
+**Intel required (for now)** — any supported NPU, or an iGPU at least as new as Iris Xe.
+
+**Use a commercial camera** — Dahua, Axis, Uniview, Hikvision, Hanwha, etc. — so you can tune exposure, gain and day/night, and get a **640-horizontal-pixel sub stream**.
 
 ## ESP32 wiring
 
