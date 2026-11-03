@@ -31,7 +31,7 @@ This is a personal project. I got tired of re-teaching myself my old self-built 
 
 **▶ [Preview video](preview/example.mp4)** — live tracking and relays firing.
 
-Poor video quality, first time using Uniview prop, day/night/illumination not locked down hard enough and gain too high — still works great.
+Poor video quality, first time using Uniview prop at night, day/night/illumination not locked down hard enough and gain too high — still works great.
 
 ## Limitations
 
@@ -131,3 +131,4 @@ Everything's on `/setup`, saves to `./data/config.yml`, and most of it applies *
 2. Webhook outputs for Home Assistant or other web-based scares.
 3. Additional or backup sensor inputs. (Questionable — Halloween went better than expected, I'm ditching the lasers for good.)
 4. Manual push-button triggers without a position trigger (more check boxes).
+5. Continue to improve tracking.
