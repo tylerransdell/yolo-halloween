@@ -1,7 +1,5 @@
 # YOLO-Halloween
 
-**▶ [Preview video](preview/example.mp4)** — live tracking and relays firing.
-
 An early-development Halloween trigger engine. Point a camera at your walkway, it watches people move through, and it trips relays as they hit your marks. Two pieces:
 
 - **ESP32 firmware** — a tiny control app, an API, and UDP discovery. This is what actually drives the relays. Build instructions below. $20 max.
@@ -28,6 +26,12 @@ This is a personal project. I got tired of re-teaching myself my old self-built 
 - **Docker + `/data` volume.** Config and model live in `./data`, so the container stays disposable.
 - **Sane controller link.** One serialized TCP connection at a time (basic ESP32s wedge on concurrent clients), bounded timeouts, retries, an idle PING keep-alive, and a non-blocking command queue so a slow board can't stall inference.
 - **WLED lighting (optional).** Creepy position-based effects, quadratic 3-point calibration, up to 4 pixel runs.
+
+## Preview
+
+**▶ [Preview video](preview/example.mp4)** — live tracking and relays firing.
+
+Poor video quality, first time using Uniview prop, day/night/illumination not locked down hard enough and gain too high — still works great.
 
 ## Limitations
 
