@@ -16,3 +16,6 @@ data/
 # Local notes & scratch
 error.md
 *.log
+
+# Repo-hosted preview video (linked from README) -- docs only, never needed at runtime
+preview/
